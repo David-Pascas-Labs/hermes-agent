@@ -25,6 +25,11 @@ class _CurrentBuilderReached(RuntimeError):
         self.display_metadata = display_metadata
 
 
+class _UninspectableBuilderReached(RuntimeError):
+    def __init__(self, kwargs):
+        self.kwargs = kwargs
+
+
 def _legacy_build_turn_context(
     agent,
     user_message,
@@ -68,6 +73,26 @@ def _current_build_turn_context(
     )
 
 
+def _kwargs_build_turn_context(*args, **kwargs):
+    """A wrapper-style builder advertises support through ``**kwargs``."""
+    raise _CurrentBuilderReached(
+        kwargs.get("persist_user_display_kind"),
+        kwargs.get("persist_user_display_metadata"),
+    )
+
+
+class _UninspectableBuildTurnContext:
+    """Remain callable even when signature introspection is unavailable."""
+
+    __signature__ = object()
+
+    def __call__(self, *args, **kwargs):
+        raise _UninspectableBuilderReached(kwargs)
+
+
+_uninspectable_build_turn_context = _UninspectableBuildTurnContext()
+
+
 def test_normal_turn_after_model_switch_tolerates_loaded_legacy_builder(monkeypatch):
     monkeypatch.setattr(
         conversation_loop,
@@ -104,3 +129,43 @@ def test_current_builder_still_receives_synthetic_turn_display_fields(monkeypatc
 
     assert reached.value.display_kind == "model_switch"
     assert reached.value.display_metadata == {"model": "test-model"}
+
+
+def test_kwargs_builder_receives_synthetic_turn_display_fields(monkeypatch):
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        _kwargs_build_turn_context,
+    )
+
+    with pytest.raises(_CurrentBuilderReached) as reached:
+        conversation_loop.run_conversation(
+            SimpleNamespace(),
+            "delegation context",
+            persist_user_display_kind="delegation",
+            persist_user_display_metadata={"task_count": 2},
+            moa_config={},
+        )
+
+    assert reached.value.display_kind == "delegation"
+    assert reached.value.display_metadata == {"task_count": 2}
+
+
+def test_uninspectable_builder_fails_closed_without_display_fields(monkeypatch):
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        _uninspectable_build_turn_context,
+    )
+
+    with pytest.raises(_UninspectableBuilderReached) as reached:
+        conversation_loop.run_conversation(
+            SimpleNamespace(),
+            "model-switch context",
+            persist_user_display_kind="model_switch",
+            persist_user_display_metadata={"model": "test-model"},
+            moa_config={},
+        )
+
+    assert "persist_user_display_kind" not in reached.value.kwargs
+    assert "persist_user_display_metadata" not in reached.value.kwargs
