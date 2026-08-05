@@ -285,11 +285,28 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _tool_search_additional_deferrable_names(
+    enabled_toolsets: Optional[List[str]],
+    platform: Optional[str] = None,
+) -> frozenset[str]:
+    """Resolve the session-static built-in disclosure policy."""
+    try:
+        from toolsets import progressive_disclosure_builtin_tools
+        return progressive_disclosure_builtin_tools(
+            enabled_toolsets,
+            platform=platform,
+            is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+        )
+    except Exception:
+        return frozenset()
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    platform: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -305,6 +322,9 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        platform: Runtime platform name. Used by platform-static schema policy
+            (for example Telegram progressive disclosure) and included in the
+            memoization key so cached tool snapshots never cross platforms.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -328,6 +348,7 @@ def get_tool_definitions(
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
+            platform,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
@@ -344,8 +365,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        platform=platform,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -369,6 +395,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    platform: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -549,11 +576,10 @@ def _compute_tool_definitions(
         logger.warning("Schema sanitization skipped: %s", e)
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
-    # Conditionally replace MCP + plugin (non-core) tools with three bridge
-    # tools (tool_search / tool_describe / tool_call) when the deferrable
-    # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
-    # deferred. See tools/tool_search.py for full design notes.
+    # Conditionally replace deferrable tools with three bridge tools
+    # (tool_search / tool_describe / tool_call). MCP/plugin tools are eligible
+    # globally; platform-static policy may additionally nominate built-ins.
+    # See tools/tool_search.py for full design notes.
     #
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in
@@ -567,6 +593,11 @@ def _compute_tool_definitions(
                 filtered_tools,
                 context_length=context_length,
                 config=ts_cfg,
+                additional_deferrable_names=(
+                    _tool_search_additional_deferrable_names(
+                        enabled_toolsets, platform
+                    )
+                ),
             )
             if assembly.activated and not quiet_mode:
                 _forms = {"full": "catalog listing embedded",
@@ -576,7 +607,7 @@ def _compute_tool_definitions(
                           "none": "no listing (search-only)"}
                 print(
                     f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
-                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
+                    f"eligible tools deferred (~{assembly.deferred_tokens} tokens) behind "
                     f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
             filtered_tools = assembly.tool_defs
@@ -1097,6 +1128,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    platform: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1118,6 +1150,8 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        platform: Runtime platform used to preserve the same platform-static
+                       disclosure policy during bridge lookup and invocation.
 
     Returns:
         Function result as a JSON string.
@@ -1158,17 +1192,30 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
+                platform=platform,
             ) or []
         except Exception:
             current_defs = []
+        _additional_deferrable = _tool_search_additional_deferrable_names(
+            enabled_toolsets, platform
+        )
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
-            return _ts_mod.dispatch_tool_search(function_args or {},
-                                                current_tool_defs=current_defs)
+            return _ts_mod.dispatch_tool_search(
+                function_args or {},
+                current_tool_defs=current_defs,
+                additional_deferrable_names=_additional_deferrable,
+            )
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
-            return _ts_mod.dispatch_tool_describe(function_args or {},
-                                                  current_tool_defs=current_defs)
+            return _ts_mod.dispatch_tool_describe(
+                function_args or {},
+                current_tool_defs=current_defs,
+                additional_deferrable_names=_additional_deferrable,
+            )
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {},
+                additional_deferrable_names=_additional_deferrable,
+            )
             if err or not underlying_name:
                 return tool_error(err or "tool_call could not be resolved")
             # Defense in depth: the underlying tool MUST be in the session's
@@ -1177,7 +1224,9 @@ def handle_function_call(
             # additionally rejects any tool the session was not granted, so a
             # restricted session can never invoke an out-of-scope tool through
             # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+            _scoped_deferrable = _ts_mod.scoped_deferrable_names(
+                current_defs, _additional_deferrable
+            )
             if underlying_name not in _scoped_deferrable:
                 return tool_error(
                     f"'{underlying_name}' is not available in this session. "
@@ -1205,6 +1254,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                platform=platform,
             )
 
     _tool_original_args = dict(function_args)
