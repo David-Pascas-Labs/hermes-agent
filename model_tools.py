@@ -48,6 +48,17 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def _is_dispatcher_owned_worker() -> bool:
+    """False when HERMES_KANBAN_* is present but this execution does not own it
+    (delegate_task child, or a cron job fired in-process from a worker)."""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -354,6 +365,7 @@ def get_tool_definitions(
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
+            _is_dispatcher_owned_worker(),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -406,6 +418,7 @@ def _compute_tool_definitions(
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
+            and _is_dispatcher_owned_worker()
             and "kanban" not in effective_enabled_toolsets
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
