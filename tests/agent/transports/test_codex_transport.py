@@ -36,6 +36,33 @@ class TestCodexTransportBasic:
         assert result[0]["type"] == "function"
         assert result[0]["name"] == "terminal"
 
+    def test_openai_codex_receives_collapsed_telegram_tool_surface(
+        self, transport, monkeypatch,
+    ):
+        """The Responses conversion must consume the platform-resolved tool
+        snapshot, not rebuild the full eager core for openai-codex.
+        """
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        _clear_tool_defs_cache()
+        telegram_tools = get_tool_definitions(
+            enabled_toolsets=sorted(_get_platform_tools({}, "telegram")),
+            quiet_mode=True,
+            platform="telegram",
+        )
+        converted = transport.convert_tools(telegram_tools)
+        names = {tool["name"] for tool in converted}
+
+        assert BRIDGE_TOOL_NAMES <= names
+        assert {"clarify", "memory"} <= names
+        assert not {
+            "terminal", "read_file", "write_file", "browser_navigate",
+            "skill_manage", "execute_code", "cronjob", "text_to_speech",
+        } & names
+
 
 class TestCodexBuildKwargs:
 

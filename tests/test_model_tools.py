@@ -382,6 +382,139 @@ class TestBackwardCompat:
         assert isinstance(result, str)
 
 
+class TestPlatformProgressiveDisclosure:
+    """Tool Search keeps rich Telegram capabilities without eagerly shipping
+    every specialist schema. CLI and worker surfaces remain unchanged.
+    """
+
+    @staticmethod
+    def _names(tool_defs):
+        return {tool["function"]["name"] for tool in tool_defs}
+
+    def test_normal_telegram_defers_specialist_builtin_tools(self, monkeypatch):
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        _clear_tool_defs_cache()
+        toolsets = sorted(_get_platform_tools({}, "telegram"))
+        raw = get_tool_definitions(
+            enabled_toolsets=toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            platform="telegram",
+        )
+        assembled = get_tool_definitions(
+            enabled_toolsets=toolsets,
+            quiet_mode=True,
+            platform="telegram",
+        )
+        raw_names = self._names(raw)
+        names = self._names(assembled)
+
+        assert BRIDGE_TOOL_NAMES <= names
+        assert {"clarify", "memory"} <= names
+        specialist = {
+            "terminal", "process", "read_file", "write_file", "patch",
+            "search_files", "browser_navigate", "skills_list", "skill_view",
+            "skill_manage", "execute_code", "delegate_task", "cronjob",
+            "text_to_speech", "todo", "session_search",
+        }
+        assert specialist & raw_names
+        assert not specialist & names
+        assert len(names) < len(raw_names)
+
+    def test_cli_keeps_direct_tools_and_no_bridge(self, monkeypatch):
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        _clear_tool_defs_cache()
+        names = self._names(get_tool_definitions(
+            enabled_toolsets=["hermes-cli"], quiet_mode=True,
+        ))
+
+        assert not BRIDGE_TOOL_NAMES & names
+        assert {"terminal", "read_file", "write_file", "patch", "search_files"} <= names
+
+    def test_platform_disclosure_cache_is_stable_and_scoped(self, monkeypatch):
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        _clear_tool_defs_cache()
+        toolsets = sorted(_get_platform_tools({}, "telegram"))
+
+        telegram = get_tool_definitions(
+            enabled_toolsets=toolsets, quiet_mode=True, platform="telegram",
+        )
+        non_telegram = get_tool_definitions(
+            enabled_toolsets=toolsets, quiet_mode=True,
+        )
+        telegram_again = get_tool_definitions(
+            enabled_toolsets=toolsets, quiet_mode=True, platform="telegram",
+        )
+
+        assert telegram == telegram_again
+        assert "terminal" not in self._names(telegram)
+        assert "terminal" in self._names(non_telegram)
+
+    def test_kanban_worker_keeps_lifecycle_and_coding_tools(self, monkeypatch):
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_worker")
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        names = self._names(get_tool_definitions(
+            enabled_toolsets=["hermes-cli"], quiet_mode=True,
+        ))
+
+        assert not BRIDGE_TOOL_NAMES & names
+        assert {
+            "terminal", "read_file", "write_file", "patch", "search_files",
+            "kanban_show", "kanban_comment", "kanban_complete", "kanban_block",
+        } <= names
+
+    def test_telegram_bridge_finds_describes_and_invokes_builtin_tool(
+        self, monkeypatch, tmp_path,
+    ):
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import _clear_tool_defs_cache, handle_function_call
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        _clear_tool_defs_cache()
+        toolsets = sorted(_get_platform_tools({}, "telegram"))
+
+        searched = json.loads(handle_function_call(
+            "tool_search", {"query": "read a local file"},
+            enabled_toolsets=toolsets,
+            platform="telegram",
+        ))
+        hit_names = {match["name"] for match in searched["matches"]}
+        assert "read_file" in hit_names
+
+        described = json.loads(handle_function_call(
+            "tool_describe", {"name": "read_file"},
+            enabled_toolsets=toolsets,
+            platform="telegram",
+        ))
+        assert described["name"] == "read_file"
+        assert "path" in described["parameters"]["properties"]
+
+        target = tmp_path / "deferred.txt"
+        target.write_text("deferred-core-tool-ok", encoding="utf-8")
+        invoked = handle_function_call(
+            "tool_call",
+            {"name": "read_file", "arguments": {"path": str(target)}},
+            enabled_toolsets=toolsets,
+            platform="telegram",
+        )
+        assert "deferred-core-tool-ok" in invoked
+
+
 
 
 # =========================================================================
