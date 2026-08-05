@@ -5,7 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+from agent.prompt_builder import KANBAN_GUIDANCE
 
 
 def _make_agent(**overrides):
@@ -80,6 +83,41 @@ def _prompt_parts(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)
+
+
+class TestKanbanWorkerGuidance:
+    @pytest.mark.parametrize("platform", ["telegram", "discord", "tui"])
+    def test_normal_chat_does_not_receive_worker_protocol(
+        self, monkeypatch, platform
+    ):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        agent = _make_agent(
+            platform=platform,
+            valid_tool_names=["kanban_show", "kanban_create"],
+            # A normal orchestrator profile can expose kanban_show. Even stale
+            # pre-resolved guidance must not bypass the dispatcher env gate.
+            _kanban_worker_guidance=KANBAN_GUIDANCE,
+        )
+
+        stable = _stable_prompt(agent)
+
+        assert "# Kanban task execution protocol" not in stable
+        assert "Call `kanban_show()` first" not in stable
+        assert "kanban_complete" not in stable
+
+    def test_dispatcher_worker_receives_worker_protocol(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker123")
+        agent = _make_agent(
+            platform="cli",
+            valid_tool_names=["kanban_show", "kanban_complete"],
+            _kanban_worker_guidance=None,
+        )
+
+        stable = _stable_prompt(agent)
+
+        assert "# Kanban task execution protocol" in stable
+        assert "Call `kanban_show()` first" in stable
+        assert "kanban_complete" in stable
 
 
 def _init_code_repo(path):
