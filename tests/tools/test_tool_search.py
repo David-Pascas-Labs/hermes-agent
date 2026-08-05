@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from types import SimpleNamespace
 from typing import List, Dict, Any
 
 import pytest
@@ -516,3 +517,67 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+class TestExecutorDeferredBuiltinScope:
+    def test_execute_code_receives_full_telegram_session_scope(self, monkeypatch):
+        from agent.tool_executor import _enabled_tools_for_dispatch
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import _clear_tool_defs_cache
+        from tools.registry import invalidate_check_fn_cache
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        agent = SimpleNamespace(
+            enabled_toolsets=sorted(_get_platform_tools({}, "telegram")),
+            disabled_toolsets=None,
+            valid_tool_names=set(BRIDGE_TOOL_NAMES) | {"clarify", "memory"},
+            platform="telegram",
+        )
+
+        enabled = set(_enabled_tools_for_dispatch(agent))
+        assert {"execute_code", "read_file", "terminal"} <= enabled
+        assert set(BRIDGE_TOOL_NAMES) <= enabled
+
+    def test_concurrent_dispatch_forwards_deferred_telegram_scope(
+        self, monkeypatch,
+    ):
+        from agent.agent_runtime_helpers import invoke_tool
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import _clear_tool_defs_cache
+        from tools.registry import invalidate_check_fn_cache
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        captured = {}
+        monkeypatch.setattr(
+            "run_agent.handle_function_call",
+            lambda *_args, **kwargs: captured.update(kwargs) or "ok",
+        )
+        agent = SimpleNamespace(
+            _memory_manager=None,
+            session_id="telegram-session",
+            valid_tool_names=set(BRIDGE_TOOL_NAMES) | {"clarify", "memory"},
+            enabled_toolsets=sorted(_get_platform_tools({}, "telegram")),
+            disabled_toolsets=None,
+            platform="telegram",
+        )
+
+        result = invoke_tool(
+            agent,
+            "execute_code",
+            {"code": "print('ok')"},
+            "task-id",
+            pre_tool_block_checked=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+
+        assert result == "ok"
+        assert {"execute_code", "read_file", "terminal"} <= set(
+            captured["enabled_tools"]
+        )

@@ -1365,10 +1365,11 @@ class TestExecuteToolCalls:
             "run_agent.handle_function_call", return_value="search result"
         ) as mock_hfc:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
-            # enabled_tools passes the agent's own valid_tool_names
             args, kwargs = mock_hfc.call_args
             assert args[:3] == ("web_search", {"q": "test"}, "task-1")
-            assert set(kwargs.get("enabled_tools", [])) == agent.valid_tool_names
+            # The sandbox keeps every model-visible tool plus any tool deferred
+            # behind Tool Search for this session scope.
+            assert agent.valid_tool_names <= set(kwargs.get("enabled_tools", []))
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
@@ -1767,19 +1768,22 @@ class TestConcurrentToolExecution:
         """_invoke_tool should route regular tools through handle_function_call."""
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
-            mock_hfc.assert_called_once_with(
-                "web_search", {"q": "test"}, "task-1",
-                tool_call_id=None,
-                session_id=agent.session_id,
-                turn_id="",
-                api_request_id="",
-                enabled_tools=list(agent.valid_tool_names),
-                skip_pre_tool_call_hook=True,
-                skip_tool_request_middleware=True,
-                enabled_toolsets=agent.enabled_toolsets,
-                disabled_toolsets=agent.disabled_toolsets,
-                tool_request_middleware_trace=[],
-            )
+            args, kwargs = mock_hfc.call_args
+            assert args == ("web_search", {"q": "test"}, "task-1")
+            enabled_tools = kwargs.pop("enabled_tools")
+            assert kwargs == {
+                "tool_call_id": None,
+                "session_id": agent.session_id,
+                "turn_id": "",
+                "api_request_id": "",
+                "skip_pre_tool_call_hook": True,
+                "skip_tool_request_middleware": True,
+                "enabled_toolsets": agent.enabled_toolsets,
+                "disabled_toolsets": agent.disabled_toolsets,
+                "platform": agent.platform,
+                "tool_request_middleware_trace": [],
+            }
+            assert agent.valid_tool_names <= set(enabled_tools)
             assert result == "result"
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):

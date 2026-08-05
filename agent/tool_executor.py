@@ -271,6 +271,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        getattr(agent, "platform", None),
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -281,8 +282,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
             disabled_toolsets=disabled,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            platform=getattr(agent, "platform", None),
         ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        additional = model_tools._tool_search_additional_deferrable_names(
+            enabled, getattr(agent, "platform", None)
+        )
+        names = _ts.scoped_deferrable_names(scoped_defs, additional)
     except Exception:
         names = frozenset()
     try:
@@ -290,6 +295,20 @@ def _tool_search_scoped_names(agent) -> frozenset:
     except Exception:
         pass
     return names
+
+
+def _enabled_tools_for_dispatch(agent) -> Optional[list[str]]:
+    """All tools granted to the session, including deferred built-ins.
+
+    ``execute_code`` enforces its own nested-call allowlist. Feeding it only
+    ``agent.valid_tool_names`` would limit a Telegram session to the three
+    bridge schemas plus its eager waist, making deferred tools searchable but
+    unusable from the sandbox. Union the scoped catalog without changing which
+    direct tool calls the model itself may emit.
+    """
+    names = set(getattr(agent, "valid_tool_names", None) or ())
+    names.update(_tool_search_scoped_names(agent))
+    return sorted(names) if names else None
 
 
 @dataclass
@@ -704,9 +723,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _scoped_names = _tool_search_scoped_names(agent)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args, additional_deferrable_names=_scoped_names
+                )
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying in _scoped_names:
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.
@@ -1378,9 +1400,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             from tools import tool_search as _ts
             if function_name == _ts.TOOL_CALL_NAME:
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
+                _scoped_names = _tool_search_scoped_names(agent)
+                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
+                    function_args, additional_deferrable_names=_scoped_names
+                )
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    if _underlying in _scoped_names:
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.
@@ -1679,17 +1704,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
-                        enabled_tools=(
-                            list(agent.valid_tool_names)
-                            if agent.valid_tool_names
-                            else None
-                        ),
+                        enabled_tools=_enabled_tools_for_dispatch(agent),
                         skip_pre_tool_call_hook=True,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        platform=getattr(agent, "platform", None),
                     )
 
                 (
@@ -1749,17 +1771,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
-                        enabled_tools=(
-                            list(agent.valid_tool_names)
-                            if agent.valid_tool_names
-                            else None
-                        ),
+                        enabled_tools=_enabled_tools_for_dispatch(agent),
                         skip_pre_tool_call_hook=True,
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        platform=getattr(agent, "platform", None),
                     )
 
                 (

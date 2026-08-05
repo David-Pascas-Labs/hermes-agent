@@ -81,6 +81,42 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
 ]
 
+# Normal Telegram chats keep only the tiny conversational waist eager. The
+# rest of the built-in catalog stays granted to the session but is disclosed
+# through Tool Search on demand. Execution-heavy tools are intentionally not
+# eager on a chat surface; CLI/ACP/cron/API and Kanban workers retain their
+# existing direct schemas.
+_HERMES_TELEGRAM_EAGER_TOOLS = frozenset({"clarify", "memory"})
+
+
+def progressive_disclosure_builtin_tools(
+    enabled_toolsets: Optional[List[str]],
+    *,
+    platform: Optional[str] = None,
+    is_kanban_worker: bool = False,
+) -> frozenset[str]:
+    """Built-in tools eligible for Tool Search in this platform scope.
+
+    The policy is deliberately narrow: only a normal ``hermes-telegram``
+    session opts in. Explicit Kanban scopes and non-chat execution surfaces
+    stay eager so lifecycle/coding automation never loses its direct tools.
+    The returned names are still constrained by the session's resolved tool
+    definitions before they can be searched or called.
+    """
+    enabled = frozenset(enabled_toolsets or [])
+    is_telegram = platform == "telegram" or "hermes-telegram" in enabled
+    if (
+        is_kanban_worker
+        or not is_telegram
+        or enabled & {
+            "hermes-cli", "hermes-acp", "hermes-cron", "hermes-api-server",
+            "coding",
+        }
+    ):
+        return frozenset()
+    return frozenset(_HERMES_CORE_TOOLS) - _HERMES_TELEGRAM_EAGER_TOOLS
+
+
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
 # constrained to avoid local file/system execution by prompt injection.
