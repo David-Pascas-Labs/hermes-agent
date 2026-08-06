@@ -529,6 +529,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    standard_chat_guardrails=None,
 ):
     """
     Initialize the AI Agent.
@@ -600,6 +601,10 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    # Opt-in safety rail for ordinary gateway chats. Worker/CLI callers leave
+    # this unset so their autonomous tool budget is unchanged.
+    agent.standard_chat_guardrails = standard_chat_guardrails
+    agent._standard_chat_guardrail_stop = None
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy

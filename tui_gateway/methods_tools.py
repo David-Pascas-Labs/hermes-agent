@@ -1624,7 +1624,7 @@ def _(rid, params: dict) -> dict:
         from tools.cronjob_tools import cronjob
 
         if action == "list":
-            return _ok(rid, json.loads(cronjob(action="list")))
+            return _ok(rid, json.loads(cronjob(action="list", full=True)))
         if action == "add":
             return _ok(
                 rid,
