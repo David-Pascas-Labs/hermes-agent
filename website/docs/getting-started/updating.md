@@ -60,6 +60,29 @@ updates:
 
 In the desktop app this is **Settings → Advanced → In-App Update Local Changes**.
 
+### Preserving committed deployment overlays
+
+A stock install treats `origin/<branch>` as authoritative. If local and remote
+history diverge, the updater's default fallback resets the checked-out branch
+to the fetched remote. Managed deployments that intentionally carry reviewed,
+committed overlays can opt into rebasing those commits instead:
+
+```bash
+hermes config set updates.preserve_local_commits true
+```
+
+With this setting enabled, a non-fast-forward update runs `git rebase
+origin/<branch>`. If the overlay applies cleanly, Hermes continues the update
+with the local commits preserved on top of the new upstream base. If it
+conflicts, the rebase is aborted and the update stops without resetting the
+committed overlay. Resolve and test the overlay in a separate worktree before
+retrying. Keep a patch/commit backup outside the source checkout; this setting
+protects normal `hermes update` runs, not an operator-issued destructive Git
+reset.
+
+Leave this setting off for unmodified installs and for checkouts where the
+remote branch should always be authoritative.
+
 ### Preview-only: `hermes update --check`
 
 Want to know if an update is available before pulling? Run `hermes update --check` — it fetches and compares commits against `origin/main`. No files are modified, no gateway is restarted. Useful in scripts and cron jobs that gate on "is there an update".

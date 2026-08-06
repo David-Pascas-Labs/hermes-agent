@@ -1000,6 +1000,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         ),
         "options": ["stash", "discard"],
     },
+    "updates.preserve_local_commits": {
+        "type": "boolean",
+        "description": (
+            "Rebase committed local overlays onto fetched updates instead of "
+            "resetting them away when local and remote history diverge. A "
+            "rebase conflict aborts the update without discarding the overlay."
+        ),
+    },
     "updates.refresh_cua_driver": {
         "type": "boolean",
         "description": (

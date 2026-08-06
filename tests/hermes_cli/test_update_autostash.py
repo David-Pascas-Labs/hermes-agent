@@ -116,6 +116,7 @@ def _make_update_side_effect(
     commit_count="3",
     ff_only_fails=False,
     reset_fails=False,
+    rebase_fails=False,
     fetch_fails=False,
     fetch_stderr="",
 ):
@@ -143,6 +144,20 @@ def _make_update_side_effect(
                     returncode=128,
                 )
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
+        if "rebase --abort" in joined:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rebase origin/main" in joined:
+            if rebase_fails:
+                return SimpleNamespace(
+                    stdout="",
+                    stderr="CONFLICT (content): Merge conflict in local.py\n",
+                    returncode=1,
+                )
+            return SimpleNamespace(
+                stdout="Successfully rebased and updated refs/heads/main.\n",
+                stderr="",
+                returncode=0,
+            )
         if "reset" in joined and "--hard" in joined:
             if reset_fails:
                 return SimpleNamespace(stdout="", stderr="error: unable to write\n", returncode=1)
@@ -191,6 +206,71 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
     out = capsys.readouterr().out
     assert "preserved in stash" in out
+
+
+def test_cmd_update_rebases_local_commits_when_preservation_enabled(
+    monkeypatch, tmp_path, capsys
+):
+    """Opted-in managed overlays are rebased, never reset away."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {"updates": {"preserve_local_commits": True}},
+    )
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    commands = [" ".join(str(part) for part in cmd) for cmd in recorded]
+    assert any("rebase origin/main" in cmd for cmd in commands)
+    assert not any("reset --hard origin/main" in cmd for cmd in commands)
+    assert "Preserved local commits rebased successfully" in capsys.readouterr().out
+
+
+def test_cmd_update_aborts_failed_overlay_rebase_without_remote_reset(
+    monkeypatch, tmp_path, capsys
+):
+    """A conflicting overlay fails closed and returns to its original graph."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda *a, **kw: {"updates": {"preserve_local_commits": True}},
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *a, **kw: "dirty-state-stash-ref",
+    )
+    restore_calls = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restore_calls.append((a, kw)) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, rebase_fails=True
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    commands = [" ".join(str(part) for part in cmd) for cmd in recorded]
+    assert any("rebase origin/main" in cmd for cmd in commands)
+    assert any("rebase --abort" in cmd for cmd in commands)
+    assert not any("reset --hard origin/main" in cmd for cmd in commands)
+    assert len(restore_calls) == 1
+    assert restore_calls[0][1]["prompt_user"] is False
+    out = capsys.readouterr().out
+    assert "stopped without resetting them" in out
+    assert "Original committed overlay restored" in out
+    assert "Pre-update working-tree changes restored" in out
 
 
 # ---------------------------------------------------------------------------

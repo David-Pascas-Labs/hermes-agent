@@ -3583,18 +3583,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
         or not (sys.stdin.isatty() and sys.stdout.isatty())
     )
     discard_local_changes = False
-    if _non_interactive_update:
-        try:
-            from hermes_cli.config import load_config
+    preserve_local_commits = False
+    try:
+        from hermes_cli.config import load_config
 
-            _update_cfg = (load_config() or {}).get("updates", {})
-            if isinstance(_update_cfg, dict):
-                _mode = str(_update_cfg.get("non_interactive_local_changes", "stash")).lower()
+        _update_cfg = (load_config() or {}).get("updates", {})
+        if isinstance(_update_cfg, dict):
+            preserve_local_commits = bool(
+                _update_cfg.get("preserve_local_commits", False)
+            )
+            if _non_interactive_update:
+                _mode = str(
+                    _update_cfg.get("non_interactive_local_changes", "stash")
+                ).lower()
                 discard_local_changes = _mode == "discard"
-        except Exception as exc:
-            # Never let a config read failure change the safe default.
-            logger.debug("Could not read updates.non_interactive_local_changes: %s", exc)
-            discard_local_changes = False
+    except Exception as exc:
+        # Never let a config read failure opt into non-default update behavior.
+        logger.debug("Could not read update behavior config: %s", exc)
+        discard_local_changes = False
+        preserve_local_commits = False
 
     print("⚕ Updating Hermes Agent...")
     print()
@@ -3969,26 +3976,87 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                # ff-only failed — local and remote have diverged. Managed
+                # deployments can opt into preserving committed overlays by
+                # rebasing them onto the freshly fetched remote branch. The
+                # default remains the historical exact-origin reset.
+                if preserve_local_commits:
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        "  ⚠ Fast-forward not possible (history diverged); "
+                        "rebasing preserved local commits onto the remote..."
                     )
-                    sys.exit(1)
+                    rebase_result = subprocess.run(
+                        git_cmd + ["rebase", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if rebase_result.returncode != 0:
+                        abort_result = subprocess.run(
+                            git_cmd + ["rebase", "--abort"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        print(
+                            "✗ Could not rebase preserved local commits; "
+                            "the update was stopped without resetting them."
+                        )
+                        detail = (
+                            rebase_result.stderr.strip()
+                            or rebase_result.stdout.strip()
+                        )
+                        if detail:
+                            print(f"  {detail.splitlines()[0]}")
+                        if abort_result.returncode != 0:
+                            print(
+                                "  ⚠ Automatic rebase abort also failed; "
+                                "inspect `git status` before retrying."
+                            )
+                        else:
+                            print("  ✓ Original committed overlay restored.")
+                            if auto_stash_ref is not None:
+                                restored = _m()._restore_stashed_changes(
+                                    git_cmd,
+                                    _m().PROJECT_ROOT,
+                                    auto_stash_ref,
+                                    prompt_user=False,
+                                )
+                                if restored:
+                                    auto_stash_ref = None
+                                    print(
+                                        "  ✓ Pre-update working-tree changes "
+                                        "restored."
+                                    )
+                        print(
+                            "  Resolve the overlay against origin/"
+                            f"{branch} in a worktree, then retry."
+                        )
+                        sys.exit(1)
+                    print("  ✓ Preserved local commits rebased successfully.")
+                else:
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), "
+                        "resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

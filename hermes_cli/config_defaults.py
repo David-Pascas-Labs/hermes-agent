@@ -2784,6 +2784,12 @@ DEFAULT_CONFIG = {
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
         "non_interactive_local_changes": "stash",
+        # Preserve committed local overlays when the checked-out branch and
+        # origin have diverged. When enabled, ``hermes update`` rebases local
+        # commits onto the fetched remote instead of resetting them away. A
+        # conflict aborts the update and restores the pre-update commit graph.
+        # Off by default so stock installs retain their historical behavior.
+        "preserve_local_commits": False,
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example
