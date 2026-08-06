@@ -629,6 +629,9 @@ def finalize_turn(
             break
 
     # Build result with interrupt info if applicable
+    _standard_chat_guardrail = getattr(
+        agent, "_standard_chat_guardrail_stop", None
+    )
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
@@ -637,7 +640,7 @@ def finalize_turn(
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
-        "partial": False,  # True only when stopped due to invalid tool calls
+        "partial": bool(_standard_chat_guardrail),
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
@@ -665,6 +668,9 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    elif _standard_chat_guardrail:
+        result["guardrail"] = dict(_standard_chat_guardrail)
+        result["error"] = final_response
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
     # (and desktop can toast disk-full) instead of a quiet complete frame.

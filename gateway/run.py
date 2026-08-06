@@ -4458,6 +4458,14 @@ class TurnRunner:
         _skip_context = _plat_gw_cfg.get("skip_context_files")
         skip_context_files = bool(_skip_context) if _skip_context is not None else False
 
+        from agent.standard_chat_guardrails import resolve_standard_chat_guardrails
+
+        standard_chat_guardrails = resolve_standard_chat_guardrails(
+            ctx.user_config,
+            platform=platform_key,
+            is_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+        )
+
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
         # schemas for prompt cache hits.
@@ -4635,6 +4643,7 @@ class TurnRunner:
                         # Refresh agent max_iterations from current config
                         # (cached agent may have been created with old config)
                         agent.max_iterations = max_iterations
+                        agent.standard_chat_guardrails = standard_chat_guardrails
                         logger.debug("Reusing cached agent for session %s", ctx.session_key)
                         reused_cached_agent = True
 
@@ -4677,6 +4686,7 @@ class TurnRunner:
                 **turn_route["runtime"],
                 **_checkpoint_agent_kwargs(ctx.user_config),
                 max_iterations=max_iterations,
+                standard_chat_guardrails=standard_chat_guardrails,
                 quiet_mode=True,
                 verbose_logging=False,
                 enabled_toolsets=ctx.enabled_toolsets,

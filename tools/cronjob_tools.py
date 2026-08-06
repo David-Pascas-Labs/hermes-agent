@@ -589,6 +589,11 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def get_max_list_items() -> int:
+    """Maximum cron records returned by a compact list request."""
+    return 20
+
+
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
@@ -728,6 +733,8 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    offset: int = 0,
+    full: bool = False,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -825,8 +832,39 @@ def cronjob(
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
-            return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+            all_jobs = list_jobs(include_disabled=include_disabled)
+            count = len(all_jobs)
+            if full:
+                jobs = [dict(job) for job in all_jobs]
+                next_offset = None
+                truncated = False
+            else:
+                try:
+                    start = max(0, int(offset or 0))
+                except (TypeError, ValueError):
+                    start = 0
+                end = start + get_max_list_items()
+                jobs = []
+                for job in all_jobs[start:end]:
+                    compact = _format_job(job)
+                    compact.pop("prompt_preview", None)
+                    jobs.append(compact)
+                truncated = end < count
+                next_offset = end if truncated else None
+            result = {
+                "success": True,
+                "count": count,
+                "returned": len(jobs),
+                "truncated": truncated,
+                "next_offset": next_offset,
+                "jobs": jobs,
+            }
+            if not full:
+                result["hint"] = (
+                    "Use full=true for complete job records; use next_offset "
+                    "as offset to continue a truncated list."
+                )
+            return json.dumps(result, indent=2)
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
@@ -1127,6 +1165,15 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "List offset for compact pagination."
+            },
+            "full": {
+                "type": "boolean",
+                "description": "For action=list, return every complete job record instead of the compact default."
+            },
         },
         "required": ["action"]
     }
@@ -1184,6 +1231,8 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        offset=args.get("offset", 0),
+        full=args.get("full", False),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,

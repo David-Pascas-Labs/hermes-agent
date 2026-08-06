@@ -2439,17 +2439,31 @@ PROCESS_SCHEMA = {
             },
             "offset": {
                 "type": "integer",
-                "description": "Line offset for 'log' action (default: last 200 lines)"
+                "description": "Record offset for 'list', or line offset for 'log' (default: last 200 lines)."
             },
             "limit": {
                 "type": "integer",
                 "description": "Max lines to return for 'log' action",
                 "minimum": 1
+            },
+            "full": {
+                "type": "boolean",
+                "description": "For list, return all records. For log, allow the explicitly requested limit beyond the compact default cap."
             }
         },
         "required": ["action"]
     }
 }
+
+
+def get_max_list_items() -> int:
+    """Maximum process records returned by a compact list request."""
+    return 20
+
+
+def get_max_log_lines() -> int:
+    """Maximum process log lines returned without an explicit full request."""
+    return 200
 
 
 def _redact_process_result(result: dict) -> dict:
@@ -2492,18 +2506,64 @@ def _handle_process(args, **kw):
             session_key = get_current_session_key(default="") or ""
         except Exception:
             session_key = ""
-        return json.dumps(
-            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
-            ensure_ascii=False,
+        processes = process_registry.list_sessions(
+            task_id=task_id,
+            session_key=session_key or None,
         )
+        count = len(processes)
+        full = bool(args.get("full", False))
+        if full:
+            selected = processes
+            next_offset = None
+            truncated = False
+        else:
+            try:
+                start = max(0, int(args.get("offset", 0) or 0))
+            except (TypeError, ValueError):
+                start = 0
+            end = start + get_max_list_items()
+            selected = processes[start:end]
+            truncated = end < count
+            next_offset = end if truncated else None
+        result = {
+            "count": count,
+            "returned": len(selected),
+            "truncated": truncated,
+            "next_offset": next_offset,
+            "processes": [_redact_process_result(dict(item)) for item in selected],
+        }
+        if not full:
+            result["hint"] = (
+                "Use full=true for all process records; use next_offset as "
+                "offset to continue a truncated list."
+            )
+        return json.dumps(result, ensure_ascii=False)
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":
-            return json.dumps(_redact_process_result(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
+            try:
+                requested_limit = max(1, int(args.get("limit", get_max_log_lines())))
+            except (TypeError, ValueError):
+                requested_limit = get_max_log_lines()
+            full = bool(args.get("full", False))
+            if not full:
+                requested_limit = min(requested_limit, get_max_log_lines())
+            result = _redact_process_result(process_registry.read_log(
+                session_id, offset=args.get("offset", 0), limit=requested_limit))
+            if (
+                not full
+                and isinstance(result, dict)
+                and int(result.get("total_lines") or 0) > requested_limit
+            ):
+                result["truncated"] = True
+                result["hint"] = (
+                    "Use full=true with an explicit limit to read beyond the "
+                    "compact log cap."
+                )
+            return json.dumps(result, ensure_ascii=False)
         elif action == "wait":
             return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":

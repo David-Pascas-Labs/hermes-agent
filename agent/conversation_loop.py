@@ -1358,6 +1358,9 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    standard_chat_tool_rounds = 0
+    standard_chat_warning_emitted = False
+    agent._standard_chat_guardrail_stop = None
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
     # overflow/413 retry handlers, and the post-tool compaction gate.
@@ -6351,6 +6354,11 @@ def run_conversation(
                     failed = True
                     break
 
+                # Count completed batches, not individual calls. The entire
+                # model-emitted batch is allowed to return before a standard
+                # chat safety stop, so side effects are never cut halfway.
+                standard_chat_tool_rounds += 1
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -6429,6 +6437,67 @@ def run_conversation(
                     _real_tokens = estimate_request_tokens_rough(
                         messages, tools=agent.tools or None
                     )
+
+                _standard_chat_limits = getattr(
+                    agent, "standard_chat_guardrails", None
+                )
+                if _standard_chat_limits is not None:
+                    from agent.standard_chat_guardrails import (
+                        GuardrailAction,
+                        build_standard_chat_stop_message,
+                        build_standard_chat_warning_message,
+                        evaluate_standard_chat_guardrails,
+                    )
+
+                    # Provider usage describes the request before this batch's
+                    # tool results. Include a fresh rough estimate so one large
+                    # result cannot jump silently past the context hard cap.
+                    try:
+                        _post_tool_context_tokens = max(
+                            int(_real_tokens or 0),
+                            int(estimate_request_tokens_rough(
+                                messages, tools=agent.tools or None
+                            ) or 0),
+                        )
+                    except (TypeError, ValueError):
+                        _post_tool_context_tokens = int(_real_tokens or 0)
+
+                    _standard_chat_decision = evaluate_standard_chat_guardrails(
+                        _standard_chat_limits,
+                        tool_rounds=standard_chat_tool_rounds,
+                        context_tokens=_post_tool_context_tokens,
+                    )
+                    if (
+                        _standard_chat_decision.action is GuardrailAction.WARN
+                        and not standard_chat_warning_emitted
+                    ):
+                        standard_chat_warning_emitted = True
+                        agent._emit_status(build_standard_chat_warning_message(
+                            _standard_chat_decision,
+                            _standard_chat_limits,
+                        ))
+                    elif _standard_chat_decision.action is GuardrailAction.STOP:
+                        agent._standard_chat_guardrail_stop = (
+                            _standard_chat_decision.to_metadata()
+                        )
+                        final_response = build_standard_chat_stop_message(
+                            reasons=_standard_chat_decision.reasons,
+                            tool_rounds=_standard_chat_decision.tool_rounds,
+                            context_tokens=_standard_chat_decision.context_tokens,
+                        )
+                        failed = True
+                        _turn_exit_reason = (
+                            "standard_chat_guardrail_stop("
+                            + ",".join(_standard_chat_decision.reasons)
+                            + ")"
+                        )
+                        agent._emit_status(final_response)
+                        messages.append({
+                            "role": "assistant",
+                            "content": final_response,
+                            "finish_reason": "standard_chat_guardrail_stop",
+                        })
+                        break
 
                 if (
                     agent.compression_enabled

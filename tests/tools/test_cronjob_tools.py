@@ -265,7 +265,7 @@ class TestUnifiedCronjobTool:
 
         assert listing["success"] is True
         assert listing["jobs"][0]["name"] == "abc123deadbe"
-        assert listing["jobs"][0]["prompt_preview"] == ""
+        assert "prompt_preview" not in listing["jobs"][0]
         assert listing["jobs"][0]["schedule"] == "every 60m"
 
     def test_pause_and_resume(self):
