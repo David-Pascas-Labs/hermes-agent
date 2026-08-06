@@ -246,6 +246,31 @@ def test_hard_stop_waits_for_every_call_in_the_current_tool_batch(agent):
     assert "no further tool calls were started" in result["final_response"].lower()
 
 
+def test_default_guardrail_fails_closed_at_eight_iteration_chat_limit(agent):
+    agent.max_iterations = 8
+    agent.standard_chat_guardrails = StandardChatGuardrails()
+    agent.client.chat.completions.create.side_effect = [
+        *[_tool_response(i) for i in range(1, 8)],
+        _tool_response(8, tool_count=2),
+        _stop_response("All requested work completed successfully."),
+    ]
+    handled = []
+
+    result, _statuses = _run(agent, handled)
+
+    assert agent.client.chat.completions.create.call_count == 8
+    assert handled == ["web_search"] * 9
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["partial"] is True
+    assert result["guardrail"]["kind"] == "standard_chat"
+    assert result["guardrail"]["action"] == "stop"
+    assert result["guardrail"]["reasons"] == ["iteration_limit"]
+    assert result["guardrail"]["tool_rounds"] == 8
+    assert "not complete" in result["final_response"].lower()
+    assert "completed successfully" not in result["final_response"].lower()
+
+
 def test_worker_agent_remains_unbounded_without_opt_in(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
     with (

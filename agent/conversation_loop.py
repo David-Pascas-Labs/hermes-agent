@@ -6444,6 +6444,7 @@ def run_conversation(
                 if _standard_chat_limits is not None:
                     from agent.standard_chat_guardrails import (
                         GuardrailAction,
+                        StandardChatGuardrailDecision,
                         build_standard_chat_stop_message,
                         build_standard_chat_warning_message,
                         evaluate_standard_chat_guardrails,
@@ -6467,6 +6468,27 @@ def run_conversation(
                         tool_rounds=standard_chat_tool_rounds,
                         context_tokens=_post_tool_context_tokens,
                     )
+                    # A standard gateway chat can have a configured tool-round
+                    # ceiling above the turn's actually reachable iteration
+                    # budget (the production defaults are 12 versus 8).  Once
+                    # the last reachable provider call has returned a complete
+                    # tool batch, fail closed here instead of falling through to
+                    # the generic iteration-summary path, whose extra provider
+                    # call could turn partial work into a misleading success.
+                    _standard_chat_iteration_limit_reached = (
+                        api_call_count >= agent.max_iterations
+                        or agent.iteration_budget.remaining <= 0
+                    )
+                    if (
+                        _standard_chat_iteration_limit_reached
+                        and _standard_chat_decision.action is not GuardrailAction.STOP
+                    ):
+                        _standard_chat_decision = StandardChatGuardrailDecision(
+                            GuardrailAction.STOP,
+                            ("iteration_limit",),
+                            standard_chat_tool_rounds,
+                            _post_tool_context_tokens,
+                        )
                     if (
                         _standard_chat_decision.action is GuardrailAction.WARN
                         and not standard_chat_warning_emitted

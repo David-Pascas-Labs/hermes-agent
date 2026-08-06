@@ -174,6 +174,10 @@ def build_standard_chat_stop_message(
     details = []
     if "tool_rounds" in reasons:
         details.append(f"{tool_rounds} tool rounds")
+    if "iteration_limit" in reasons:
+        details.append(
+            f"the effective iteration limit after {tool_rounds} completed tool rounds"
+        )
     if "context_tokens" in reasons:
         details.append(f"about {context_tokens:,} context tokens")
     joined = " and ".join(details) or "a configured safety threshold"
