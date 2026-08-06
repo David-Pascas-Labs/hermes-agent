@@ -1,6 +1,7 @@
 """Tests for the ``hermes prompt-size`` diagnostic (issue #34667)."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,40 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     data = compute_prompt_breakdown("cli")
     assert data["system_prompt"]["bytes"] > 0
+
+
+def test_platform_argument_matches_env_filtered_skill_index_and_stays_scoped(
+    isolated_home, monkeypatch
+):
+    _seed_skill(isolated_home, "shared-skill", "visible on every platform")
+    _seed_skill(isolated_home, "telegram-hidden", "disabled on Telegram")
+    (isolated_home / "config.yaml").write_text(
+        "skills:\n"
+        "  platform_disabled:\n"
+        "    telegram:\n"
+        "      - telegram-hidden\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+    explicit = compute_prompt_breakdown("telegram")
+    explicit_names = {skill["name"] for skill in explicit["skills_breakdown"]}
+    assert "HERMES_PLATFORM" not in os.environ
+
+    monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+    env_backed = compute_prompt_breakdown("telegram")
+    env_names = {skill["name"] for skill in env_backed["skills_breakdown"]}
+
+    assert explicit_names == env_names
+    assert explicit["skills_index"] == env_backed["skills_index"]
+    assert "shared-skill" in explicit_names
+    assert "telegram-hidden" not in explicit_names
+
+    monkeypatch.delenv("HERMES_PLATFORM")
+    cli = compute_prompt_breakdown("cli")
+    cli_names = {skill["name"] for skill in cli["skills_breakdown"]}
+    assert "telegram-hidden" in cli_names
 
 
 
