@@ -61,6 +61,12 @@ def test_platform_argument_matches_env_filtered_skill_index_and_stays_scoped(
     _seed_skill(isolated_home, "shared-skill", "visible on every platform")
     _seed_skill(isolated_home, "telegram-hidden", "disabled on Telegram")
     (isolated_home / "config.yaml").write_text(
+        # The diagnostic mirrors the real session tool schemas. Normal Telegram
+        # sessions defer the skills tools behind Tool Search, so explicitly keep
+        # them eager in this fixture to exercise the skill-index filter itself.
+        "tools:\n"
+        "  tool_search:\n"
+        "    enabled: off\n"
         "skills:\n"
         "  platform_disabled:\n"
         "    telegram:\n"
