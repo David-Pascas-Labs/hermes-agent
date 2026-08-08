@@ -143,7 +143,12 @@ def _is_safe_terminal_spill_path(path: str | os.PathLike[str]) -> bool:
         if not stat.S_ISREG(info.st_mode):
             return False
         if os.name != "nt":
-            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            getuid = getattr(os, "getuid", None)
+            if (
+                getuid is None
+                or info.st_uid != getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
                 return False
         return True
     except (OSError, RuntimeError, ValueError):
