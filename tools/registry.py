@@ -227,12 +227,27 @@ _check_fn_cache_lock = threading.Lock()
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
+    Functions marked ``_hermes_context_dependent`` are evaluated directly:
+    their verdict belongs to the current logical execution context, so neither
+    the process-global TTL cache nor last-good grace may reuse it elsewhere.
+
     Exceptions are swallowed as False. A transient False/exception within
     ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
     last-good True is returned and the failure is NOT cached, so the next call
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    if getattr(fn, "_hermes_context_dependent", False):
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "Context-dependent check_fn %s raised; dependent tools will "
+                "be unavailable in this context",
+                getattr(fn, "__qualname__", fn),
+            )
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)

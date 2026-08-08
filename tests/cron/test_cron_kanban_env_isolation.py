@@ -36,12 +36,18 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clear_kanban_detect_cache():
-    """`_detect_environment` memoizes per process; kanban is context-dependent."""
+    """Reset every process-wide cache touched by Kanban availability checks."""
     import agent.skill_utils as su
+    import model_tools
+    from tools.registry import invalidate_check_fn_cache
 
     su._ENV_DETECT_CACHE.pop("kanban", None)
+    invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
     yield
     su._ENV_DETECT_CACHE.pop("kanban", None)
+    invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
 
 
 @pytest.fixture()
@@ -249,6 +255,105 @@ class TestKanbanGatesRespectContext:
             model_tools._tool_search_additional_deferrable_names([], platform="cron")
 
         assert observed == [("cron", True), ("cron", False)]
+
+
+# ---------------------------------------------------------------------------
+# Real registry / AIAgent tool assembly
+# ---------------------------------------------------------------------------
+
+KANBAN_LIFECYCLE_TOOLS = {
+    "kanban_show",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_heartbeat",
+    "kanban_comment",
+    "kanban_attach",
+    "kanban_attach_url",
+    "kanban_attachments",
+    "kanban_create",
+    "kanban_link",
+}
+
+
+def _assemble_real_agent_tool_names(*, platform: str) -> set[str]:
+    """Run the production AIAgent -> model_tools -> registry assembly path."""
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        base_url="https://stub.invalid/v1",
+        api_key="stub",
+        provider="openai",
+        model="gpt-4o-mini",
+        enabled_toolsets=["kanban"],
+        quiet_mode=True,
+        platform=platform,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    try:
+        return set(getattr(agent, "valid_tool_names"))
+    finally:
+        agent.close()
+
+
+def _child_context(kind: str):
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+
+    return (
+        non_dispatcher_owned_context()
+        if kind == "cron"
+        else delegated_child_context()
+    )
+
+
+class TestKanbanRegistryCacheContextIsolation:
+    @pytest.fixture(autouse=True)
+    def _disable_profile_opt_in(self, monkeypatch):
+        """Only dispatcher ownership may expose Kanban in these contracts."""
+        from tools import kanban_tools
+
+        monkeypatch.setattr(kanban_tools, "_profile_has_kanban_toolset", lambda: False)
+
+    def test_dispatcher_parent_receives_every_lifecycle_tool(self, worker_env):
+        from tools import kanban_tools
+
+        assert kanban_tools._check_kanban_mode() is True
+        names = _assemble_real_agent_tool_names(platform="cli")
+        assert KANBAN_LIFECYCLE_TOOLS <= names
+        assert {"kanban_list", "kanban_unblock"}.isdisjoint(names)
+
+    @pytest.mark.parametrize("child_kind", ["cron", "delegate"])
+    def test_parent_warmup_does_not_expose_lifecycle_tools_to_child(
+        self, worker_env, child_kind
+    ):
+        from tools import kanban_tools
+
+        parent_names = _assemble_real_agent_tool_names(platform="cli")
+        assert KANBAN_LIFECYCLE_TOOLS <= parent_names
+
+        with _child_context(child_kind):
+            assert kanban_tools._check_kanban_mode() is False
+            child_names = _assemble_real_agent_tool_names(platform=child_kind)
+
+        assert KANBAN_LIFECYCLE_TOOLS.isdisjoint(child_names)
+
+    @pytest.mark.parametrize("child_kind", ["cron", "delegate"])
+    def test_child_warmup_does_not_hide_lifecycle_tools_from_parent(
+        self, worker_env, child_kind
+    ):
+        from tools import kanban_tools
+
+        with _child_context(child_kind):
+            assert kanban_tools._check_kanban_mode() is False
+            child_names = _assemble_real_agent_tool_names(platform=child_kind)
+        assert KANBAN_LIFECYCLE_TOOLS.isdisjoint(child_names)
+
+        assert kanban_tools._check_kanban_mode() is True
+        parent_names = _assemble_real_agent_tool_names(platform="cli")
+        assert KANBAN_LIFECYCLE_TOOLS <= parent_names
 
 
 # ---------------------------------------------------------------------------
