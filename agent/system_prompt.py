@@ -231,10 +231,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Kanban worker lifecycle — only present in dispatcher-spawned processes.
+    # Kanban worker lifecycle — only present in dispatcher-owned processes.
     # An explicitly configured orchestrator profile may expose kanban_show in a
     # normal gateway/TUI session, so tool presence alone is not a worker signal.
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if is_dispatcher_owned_worker_context():
         _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
         if _kanban_guidance:
             tool_guidance.append(_kanban_guidance)

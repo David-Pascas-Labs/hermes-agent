@@ -264,6 +264,52 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
 
+    def test_cron_child_does_not_inherit_worker_env_or_writable_root(self, monkeypatch):
+        import subprocess
+        from agent.delegation_context import non_dispatcher_owned_context
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "team")
+        monkeypatch.setenv("HERMES_KANBAN_BRANCH", "worker/branch")
+
+        with non_dispatcher_owned_context():
+            client = cas.CodexAppServerClient(codex_bin="codex")
+            client._closed = True
+
+        assert not any(
+            key.startswith("HERMES_KANBAN_") for key in captured["env"]
+        )
+        assert not any(
+            "sandbox_workspace_write.writable_roots" in part
+            for part in captured["cmd"]
+        )
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(

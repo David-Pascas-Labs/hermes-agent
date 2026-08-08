@@ -95,6 +95,23 @@ class TestCheckFnTransientFailureSuppression:
         assert reg._check_fn_cached(flaky) is True
         assert calls["n"] == 2  # the probe actually ran (not just cached)
 
+    def test_context_dependent_check_bypasses_ttl_and_last_good(self):
+        """Context-local verdicts must be freshly evaluated on every cache key."""
+        import tools.registry as reg
+
+        state = {"available": True, "calls": 0}
+
+        def context_dependent():
+            state["calls"] += 1
+            return state["available"]
+
+        setattr(context_dependent, "_hermes_context_dependent", True)
+
+        assert reg._check_fn_cached(context_dependent) is True
+        state["available"] = False
+        assert reg._check_fn_cached(context_dependent) is False
+        assert state["calls"] == 2
+
     def test_persistent_failure_after_grace_is_honored(self, monkeypatch):
         import tools.registry as reg
 

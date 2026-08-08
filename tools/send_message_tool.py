@@ -1981,7 +1981,9 @@ def _check_send_message():
     reply with more than the ~200-char first-line truncation the kanban
     notifier applies.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if is_dispatcher_owned_worker_context():
         return True
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -1992,6 +1994,11 @@ def _check_send_message():
         return is_gateway_running()
     except Exception:
         return False
+
+
+# The dispatcher-worker verdict comes from ContextVars for in-process cron and
+# delegated children, so it must never be cached process-wide.
+setattr(_check_send_message, "_hermes_context_dependent", True)
 
 
 async def _send_qqbot(pconfig, chat_id, message):
