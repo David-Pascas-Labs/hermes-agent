@@ -36,7 +36,7 @@ class TestTruncationSpill:
         if os.name != "nt":
             assert stat.S_IMODE(p.stat().st_mode) == 0o600
             assert stat.S_IMODE(expected_dir.stat().st_mode) == 0o700
-        full = p.read_text()
+        full = p.read_text(encoding="utf-8")
         assert "marker_head" in full and "marker_tail" in full
         # The spill contains rows that were cut from the visible window.
         assert "row_100 " in full
@@ -53,7 +53,7 @@ class TestTruncationSpill:
             "python3 -c \"print('sk-proj-' + 'a1B2c3D4e5F6g7H8i9J0' * 3); [print('pad', 'y'*90) for i in range(200)]\"",
             task_id="t-spill-3"))
         p = Path(r["full_output_path"])
-        full = p.read_text()
+        full = p.read_text(encoding="utf-8")
         assert "a1B2c3D4e5F6g7H8i9J0a1B2c3D4e5F6g7H8i9J0" not in full
         assert r["output_total_chars"] == len(full)
         assert f"Full output ({len(full):,} chars)" in r["truncation_note"]
@@ -62,7 +62,7 @@ class TestTruncationSpill:
         spill_dir = tmp_path / ".hermes" / "cache" / "terminal-output"
         spill_dir.mkdir(parents=True, exist_ok=True)
         stale = spill_dir / "out-1-2-dead.log"
-        stale.write_text("old")
+        stale.write_text("old", encoding="utf-8")
         os.utime(stale, (1, 1))
         json.loads(terminal_tool(
             "python3 -c \"[print('z'*90) for i in range(200)]\"", task_id="t-spill-4"))
@@ -93,7 +93,7 @@ class TestTruncationSpill:
         assert captured["bounded_capture"] is True
         assert len(r["output"]) <= 2100
         assert r["output_total_chars"] == len(full_output)
-        full = Path(r["full_output_path"]).read_text()
+        full = Path(r["full_output_path"]).read_text(encoding="utf-8")
         assert full == full_output
 
     def test_transform_hook_replacement_owns_spill_contract(
@@ -116,7 +116,7 @@ class TestTruncationSpill:
 
         assert r["output_total_chars"] == len(transformed)
         assert len(r["output"]) <= 2100
-        assert Path(r["full_output_path"]).read_text() == transformed
+        assert Path(r["full_output_path"]).read_text(encoding="utf-8") == transformed
 
     def test_small_transform_hook_replacement_discards_raw_spill(
         self, small_cap, monkeypatch
@@ -148,7 +148,7 @@ class TestTruncationSpill:
             task_id="t-spill-large"))
 
         p = Path(r["full_output_path"])
-        full = p.read_text()
+        full = p.read_text(encoding="utf-8")
         assert full.startswith("marker_head")
         assert full.endswith("marker_tail")
         assert full.count("q") == payload_chars
@@ -159,7 +159,7 @@ class TestTruncationSpill:
     ):
         terminal_module = importlib.import_module("tools.terminal_tool")
         victim = tmp_path / "outside-victim.log"
-        victim.write_text("do-not-touch")
+        victim.write_text("do-not-touch", encoding="utf-8")
 
         class UntrustedPathEnv:
             cwd = str(small_cap)
@@ -179,7 +179,7 @@ class TestTruncationSpill:
 
         r = json.loads(terminal_tool("printf safe", task_id="t-spill-untrusted"))
 
-        assert victim.read_text() == "do-not-touch"
+        assert victim.read_text(encoding="utf-8") == "do-not-touch"
         assert "full_output_path" not in r
         assert "output_total_chars" not in r
 
@@ -188,7 +188,7 @@ class TestTruncationSpill:
     ):
         terminal_module = importlib.import_module("tools.terminal_tool")
         victim = tmp_path / "outside-victim.log"
-        victim.write_text("do-not-touch")
+        victim.write_text("do-not-touch", encoding="utf-8")
         full_output = "remote_head\n" + ("r" * 10_000) + "\nremote_tail"
 
         class UntrustedPathEnv:
@@ -209,9 +209,9 @@ class TestTruncationSpill:
 
         r = json.loads(terminal_tool("printf safe", task_id="t-spill-untrusted-large"))
 
-        assert victim.read_text() == "do-not-touch"
+        assert victim.read_text(encoding="utf-8") == "do-not-touch"
         assert r["output_total_chars"] == len(full_output)
-        assert Path(r["full_output_path"]).read_text() == full_output
+        assert Path(r["full_output_path"]).read_text(encoding="utf-8") == full_output
 
     @pytest.mark.skipif(os.name == "nt", reason="symlink permissions vary on Windows")
     def test_profile_cache_symlink_escape_fails_closed(
@@ -241,7 +241,7 @@ class TestTruncationSpill:
 
         assert r["exit_code"] == 124
         assert "Command timed out" in r["output"]
-        full = Path(r["full_output_path"]).read_text()
+        full = Path(r["full_output_path"]).read_text(encoding="utf-8")
         assert full.startswith("timeout_head")
         assert "timeout_tail" in full
 
