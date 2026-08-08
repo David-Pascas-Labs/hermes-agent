@@ -132,10 +132,10 @@ def test_show_compact_preserves_core_counts_context_and_latest_comment(worker_en
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    long_directive = "  HUMAN DIRECTIVE: " + ("ä" * 3000) + "  "
+    directive = "  HUMAN DIRECTIVE: inspect the attached evidence first  "
     conn = kb.connect()
     try:
-        kb.add_comment(conn, worker_env, author="operator", body=long_directive)
+        kb.add_comment(conn, worker_env, author="operator", body=directive)
         expected_counts = {
             "comments": len(kb.list_comments(conn, worker_env)),
             "events": len(kb.list_events(conn, worker_env)),
@@ -167,15 +167,125 @@ def test_show_compact_preserves_core_counts_context_and_latest_comment(worker_en
     ):
         assert compact["task"][field] == full["task"][field]
     assert compact["latest_comment"]["author"] == "operator"
-    assert compact["latest_comment"]["body"].startswith("HUMAN DIRECTIVE:")
-    assert compact["latest_comment"]["body"].endswith(
-        "… [truncated, 969 chars omitted]"
-    )
+    assert compact["latest_comment"]["body"] == directive.strip()
     assert "kanban_show(mode=\"full\"" in compact["full_hint"]
     assert "kanban_attachments" in compact["full_hint"]
     assert "comments" not in compact
     assert "events" not in compact
     assert "runs" not in compact
+
+
+def test_show_compact_escalates_when_directive_is_after_comment_cap(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    directive = "MUST NOT MERGE OR DEPLOY"
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn,
+            worker_env,
+            author="operator",
+            body=("x" * 2050) + directive,
+        )
+    finally:
+        conn.close()
+
+    full = kt._handle_show({"mode": "full"})
+    compact_first = kt._handle_show({"mode": "compact"})
+    compact_second = kt._handle_show({"mode": "compact"})
+    compact = json.loads(compact_first)
+
+    assert directive in full
+    assert compact_first == compact_second
+    assert compact["compact_unavailable"] is True
+    assert compact["worker_context"] is None
+    assert "truncated_authoritative_sources" in compact
+    assert compact["truncated_authoritative_sources"]["comments"] == 1
+    assert "kanban_show(mode=\"full\"" in compact["full_hint"]
+
+
+def test_show_compact_escalates_legacy_task_result(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    directive = "MUST NOT DEPLOY WITHOUT HUMAN APPROVAL"
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?",
+            (directive, worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    full = json.loads(kt._handle_show({"mode": "full"}))
+    compact = json.loads(kt._handle_show({"mode": "compact"}))
+
+    assert full["task"]["result"] == directive
+    assert directive not in (compact.get("worker_context") or "")
+    assert compact["compact_unavailable"] is True
+    assert compact["truncated_authoritative_sources"]["task_result"] == 1
+
+
+@pytest.mark.parametrize(
+    ("card_id", "critical_fragment", "is_latest"),
+    [
+        (
+            "t_74307c94",
+            "produktiv nur nach neuer expliziter Human-Freigabe ausrollen",
+            True,
+        ),
+        (
+            "t_861bf131",
+            "nicht mergen/deployen, bis CI grün ist",
+            False,
+        ),
+        (
+            "t_d5b6c12c",
+            "Blocker dieser Ausführung",
+            False,
+        ),
+    ],
+)
+def test_show_compact_escalates_real_card_directive_tails(
+    worker_env,
+    card_id,
+    critical_fragment,
+    is_latest,
+):
+    """Regression cases from the independently reviewed 30-card golden set."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn,
+            worker_env,
+            author="reviewer",
+            body=("x" * 2050) + critical_fragment,
+        )
+        if not is_latest:
+            kb.add_comment(
+                conn,
+                worker_env,
+                author="reviewer",
+                body="Later comment without the earlier human gate.",
+            )
+        assert any(
+            critical_fragment in comment.body
+            for comment in kb.list_comments(conn, worker_env)
+        ), card_id
+    finally:
+        conn.close()
+
+    compact = json.loads(kt._handle_show({"mode": "compact"}))
+
+    assert compact["compact_unavailable"] is True, card_id
+    assert compact["worker_context"] is None, card_id
+    assert compact["truncated_authoritative_sources"]["comments"] == 1, card_id
 
 
 def test_show_compact_keeps_dependencies_handoffs_and_attachment_paths(worker_env):

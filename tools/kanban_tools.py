@@ -489,6 +489,75 @@ def _fallback_value(value: Any) -> Any:
     }
 
 
+def _compact_truncated_authoritative_sources(
+    *,
+    task: Any,
+    comments: list[Any],
+    runs: list[Any],
+    body_chars: int,
+    comment_chars: int,
+    field_chars: int,
+    max_comments: int,
+    max_prior_runs: int,
+) -> dict[str, int]:
+    """Identify canonical Full sources that worker_context cannot carry whole.
+
+    Compact is an orientation shortcut, not a semantic summarizer. If a task
+    body, comment, or prior-run field crosses ``build_worker_context``'s cap,
+    fail closed and tell the caller to request canonical Full. This avoids
+    guessing whether an omitted tail contains a human gate, blocker, or
+    merge/deploy directive.
+    """
+    truncated: dict[str, int] = {}
+
+    body = str(getattr(task, "body", None) or "").strip()
+    if len(body) > body_chars:
+        truncated["task_body"] = 1
+    if str(getattr(task, "result", None) or "").strip():
+        # A legacy result is present in canonical Full but is not rendered by
+        # build_worker_context for the task itself.
+        truncated["task_result"] = 1
+
+    lossy_comment_ids = {
+        comment.id
+        for comment in comments
+        if len(str(getattr(comment, "body", None) or "").strip())
+        > comment_chars
+    }
+    if len(comments) > max_comments:
+        lossy_comment_ids.update(
+            comment.id
+            for comment in comments[:-max_comments]
+        )
+    if lossy_comment_ids:
+        truncated["comments"] = len(lossy_comment_ids)
+
+    prior_runs = [run for run in runs if getattr(run, "ended_at", None) is not None]
+    lossy_run_ids = {
+        run.id for run in prior_runs[:-max_prior_runs]
+    }
+    for run in prior_runs[-max_prior_runs:]:
+        values = [getattr(run, "summary", None), getattr(run, "error", None)]
+        metadata = getattr(run, "metadata", None)
+        if metadata:
+            try:
+                values.append(
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+                )
+            except Exception:
+                # Unrenderable metadata cannot be proven safe for Compact.
+                lossy_run_ids.add(run.id)
+        if any(
+            len(str(value or "").strip()) > field_chars
+            for value in values
+        ):
+            lossy_run_ids.add(run.id)
+    if lossy_run_ids:
+        truncated["prior_runs"] = len(lossy_run_ids)
+
+    return truncated
+
+
 def _compact_fallback(
     *,
     task: Any,
@@ -498,6 +567,7 @@ def _compact_fallback(
     worker_context_chars: int,
     latest_comment: Optional[dict[str, Any]],
     compact_candidate_chars: int,
+    truncated_authoritative_sources: Optional[dict[str, int]] = None,
 ) -> str:
     """Return a small authoritative core when the complete compact view is too big."""
     task_core = {
@@ -517,6 +587,9 @@ def _compact_fallback(
         "compact_unavailable": True,
         "compact_candidate_chars": compact_candidate_chars,
         "compact_limit_chars": _KANBAN_SHOW_COMPACT_MAX_CHARS,
+        "truncated_authoritative_sources": (
+            truncated_authoritative_sources or {}
+        ),
         "omitted": {
             "parents": max(0, len(parents) - 50),
             "children": max(0, len(children) - 50),
@@ -565,6 +638,9 @@ def _compact_fallback(
         "compact_unavailable": True,
         "compact_candidate_chars": compact_candidate_chars,
         "compact_limit_chars": _KANBAN_SHOW_COMPACT_MAX_CHARS,
+        "truncated_authoritative_sources": (
+            truncated_authoritative_sources or {}
+        ),
         "omitted": {"parents": len(parents), "children": len(children)},
     }
     return json.dumps(emergency, ensure_ascii=False)
@@ -668,7 +744,20 @@ def _handle_show(args: dict, **kw) -> str:
                     "compact_unavailable": False,
                 }
                 compact = json.dumps(compact_payload, ensure_ascii=False)
-                if len(compact) <= _KANBAN_SHOW_COMPACT_MAX_CHARS:
+                truncated_sources = _compact_truncated_authoritative_sources(
+                    task=task,
+                    comments=comments,
+                    runs=runs,
+                    body_chars=kb._CTX_MAX_BODY_BYTES,
+                    comment_chars=kb._CTX_MAX_COMMENT_BYTES,
+                    field_chars=kb._CTX_MAX_FIELD_BYTES,
+                    max_comments=kb._CTX_MAX_COMMENTS,
+                    max_prior_runs=kb._CTX_MAX_PRIOR_ATTEMPTS,
+                )
+                if (
+                    not truncated_sources
+                    and len(compact) <= _KANBAN_SHOW_COMPACT_MAX_CHARS
+                ):
                     return compact
                 return _compact_fallback(
                     task=task,
@@ -678,6 +767,7 @@ def _handle_show(args: dict, **kw) -> str:
                     worker_context_chars=len(worker_context),
                     latest_comment=latest_comment,
                     compact_candidate_chars=len(compact),
+                    truncated_authoritative_sources=truncated_sources,
                 )
 
             return json.dumps({
