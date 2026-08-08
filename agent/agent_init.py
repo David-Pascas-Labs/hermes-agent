@@ -1416,10 +1416,12 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
+    from agent.delegation_context import is_dispatcher_owned_worker_context
     from agent.prompt_builder import KANBAN_GUIDANCE
+
     agent._kanban_worker_guidance = (
         KANBAN_GUIDANCE
-        if os.environ.get("HERMES_KANBAN_TASK")
+        if is_dispatcher_owned_worker_context()
         and "kanban_show" in agent.valid_tool_names
         else ""
     )

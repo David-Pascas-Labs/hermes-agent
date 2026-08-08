@@ -54,6 +54,20 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
 
 
+def test_cron_child_context_does_not_receive_worker_stop_nudge(clear_kanban_env):
+    """An in-process cron child may see the worker env, but is not that worker."""
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent_worker")
+    assert kanban_stop_nudge_enabled() is True
+
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+    assert kanban_stop_nudge_enabled() is True
+
+
 def test_no_nudge_after_kanban_complete(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     messages = [

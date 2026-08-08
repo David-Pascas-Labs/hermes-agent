@@ -155,6 +155,8 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
+    if not _is_dispatcher_owned_worker():
+        return None
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
@@ -170,6 +172,8 @@ def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
+    if not _is_dispatcher_owned_worker():
+        return metadata
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
@@ -199,7 +203,11 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    env_tid = (
+        os.environ.get("HERMES_KANBAN_TASK")
+        if _is_dispatcher_owned_worker()
+        else None
+    )
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
@@ -372,7 +380,7 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _is_dispatcher_owned_worker():
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
@@ -842,7 +850,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # (see _default_spawn in kanban_db.py); falling back to the
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            claim_lock = (
+                os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                if _is_dispatcher_owned_worker()
+                else None
+            )
             kb.heartbeat_claim(conn, tid, claimer=claim_lock)
 
             ok = kb.heartbeat_worker(
@@ -1217,7 +1229,11 @@ def _handle_create(args: dict, **kw) -> str:
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
             if _inherit_project and project_id is None:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+                _self_tid = (
+                    os.environ.get("HERMES_KANBAN_TASK")
+                    if _is_dispatcher_owned_worker()
+                    else None
+                )
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.project_id:

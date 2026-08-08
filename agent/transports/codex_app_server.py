@@ -93,6 +93,14 @@ class CodexAppServerClient:
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
+        from agent.delegation_context import (
+            is_non_dispatcher_owned_context,
+            scrub_kanban_worker_env,
+        )
+
+        if is_non_dispatcher_owned_context():
+            spawn_env = scrub_kanban_worker_env(spawn_env)
+
         app_server_args = list(extra_args or [])
         # Kanban workers must be able to write their handoff/status back to
         # the board DB, which lives outside the per-task workspace. Keep the

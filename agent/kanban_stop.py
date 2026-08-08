@@ -16,6 +16,8 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
+from agent.delegation_context import is_dispatcher_owned_worker_context
+
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
@@ -32,7 +34,7 @@ def kanban_stop_nudge_enabled() -> bool:
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    return bool(task) and is_dispatcher_owned_worker_context()
 
 
 def _tool_call_name(tc: Any) -> str:

@@ -501,15 +501,19 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
-    """Strip dispatcher-owned Kanban env from delegate_task child subprocesses."""
+    """Strip ambient Kanban identity from delegate and cron child processes."""
     try:
         from agent.delegation_context import (
             is_delegated_child_process_context,
+            is_non_dispatcher_owned_context,
             scrub_kanban_env,
+            scrub_kanban_worker_env,
         )
 
         if is_delegated_child_process_context():
             return scrub_kanban_env(env)
+        if is_non_dispatcher_owned_context():
+            return scrub_kanban_worker_env(env)
     except Exception:
         pass
     return env
