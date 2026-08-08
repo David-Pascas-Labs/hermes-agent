@@ -1,56 +1,156 @@
-"""Gateway runtime-metadata footer.
+"""Display-only runtime-metadata footer for terminal and gateway surfaces.
 
-Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+Renders a compact footer showing runtime state and optional numeric counters
+already present in ``state.db`` or the completed execution result. It is built
+only after the model turn and is off by default, so it never adds a provider
+call, tokens, or prompt/history/cache content.
 
 Config (``~/.hermes/config.yaml``)::
 
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
+        fields: [api_calls, input_tokens, output_tokens, cache_read_tokens, tool_calls]
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
 and any gateway platform.
 
-The footer is appended to the final response text in ``gateway/run.py`` right
-before returning the response to the adapter send path — so it only lands on
-the final message a user sees, not on tool-progress updates or streaming
-partials.  When streaming is on and the final text has already been delivered
-piecemeal, the footer is sent as a separate trailing message via
-``send_trailing_footer()``.
+The gateway appends the footer only at the final transport boundary, after the
+canonical response has already passed hooks and persistence. If streaming has
+already delivered the response, the footer is suppressed rather than creating
+a second Telegram/Discord delivery. The interactive CLI prints it as separate
+terminal chrome after the response box.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional
+import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
 
-_DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
+_DEFAULT_FIELDS: tuple[str, ...] = (
+    "api_calls",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "tool_calls",
+)
 _SEP = " · "
+_EXECUTION_FOOTER_KEYS: tuple[str, ...] = (
+    "session_id",
+    "api_calls",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "tool_calls",
+)
 
 
-def _home_relative_cwd(cwd: str) -> str:
-    """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
-    if not cwd:
-        return ""
+@dataclass(frozen=True)
+class RuntimeCounters:
+    """Non-sensitive numeric counters already recorded for one session."""
+
+    api_calls: int | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    reasoning_tokens: int | None
+    tool_calls: int | None
+
+
+def project_execution_footer_state(execution: dict[str, Any] | None) -> dict[str, Any]:
+    """Retain only fields needed by display chrome.
+
+    In particular, response text, messages, tool arguments/results, and unknown
+    metadata are dropped before the CLI keeps the completed turn for rendering.
+    ``session_id`` is retained only as the parameterized local DB lookup key and
+    is never formatted.
+    """
+    if not isinstance(execution, dict):
+        return {}
+    return {key: execution[key] for key in _EXECUTION_FOOTER_KEYS if key in execution}
+
+
+def read_local_session_counters(
+    db_path: str | os.PathLike[str] | None,
+    session_id: str | None,
+) -> RuntimeCounters | None:
+    """Read one session's counters from an existing ``state.db``.
+
+    The connection is URI ``mode=ro`` plus ``PRAGMA query_only``. Missing,
+    locked, or older-schema databases fail soft because display chrome must
+    never alter (or prevent) the agent response.
+    """
+    if not db_path or not session_id:
+        return None
+    path = Path(db_path)
+    if not path.is_file():
+        return None
     try:
-        home = os.path.expanduser("~")
-        p = os.path.abspath(cwd)
-        if home and (p == home or p.startswith(home + os.sep)):
-            return "~" + p[len(home):]
-        return p
-    except Exception:
-        return cwd
+        uri = path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.05)) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            row = conn.execute(
+                """SELECT api_call_count, input_tokens, output_tokens,
+                          cache_read_tokens, cache_write_tokens,
+                          reasoning_tokens, tool_call_count
+                     FROM sessions
+                    WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    if row is None:
+        return None
+    try:
+        values = [max(0, int(value or 0)) for value in row]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return RuntimeCounters(*values)
 
 
-def _model_short(model: Optional[str]) -> str:
-    """Drop ``vendor/`` prefix for readability (``openai/gpt-5.4`` → ``gpt-5.4``)."""
-    if not model:
-        return ""
-    return model.rsplit("/", 1)[-1]
+def _counters_from_execution(execution: dict[str, Any] | None) -> RuntimeCounters | None:
+    """Project an existing agent result onto the numeric counter allow-list."""
+    if not isinstance(execution, dict):
+        return None
+    keys = (
+        "api_calls",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "tool_calls",
+    )
+    if not any(key in execution for key in keys):
+        return None
+    values: list[int | None] = []
+    for key in keys:
+        if key not in execution:
+            values.append(None)
+            continue
+        try:
+            values.append(max(0, int(execution.get(key, 0) or 0)))
+        except (TypeError, ValueError, OverflowError):
+            values.append(None)
+    return RuntimeCounters(*values)
+
+
+def _compact_count(value: int) -> str:
+    """Format a non-negative counter without losing small exact values."""
+    value = max(0, int(value))
+    if value < 1000:
+        return str(value)
+    if value < 1_000_000:
+        return f"{value / 1000:.1f}k"
+    return f"{value / 1_000_000:.1f}M"
 
 
 def resolve_footer_config(
@@ -90,11 +190,8 @@ def resolve_footer_config(
 
 def format_runtime_footer(
     *,
-    model: Optional[str],
-    context_tokens: int,
-    context_length: Optional[int],
-    cwd: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
+    counters: RuntimeCounters | None = None,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
@@ -103,18 +200,21 @@ def format_runtime_footer(
     """
     parts: list[str] = []
     for field in fields:
-        if field == "model":
-            m = _model_short(model)
-            if m:
-                parts.append(m)
-        elif field == "context_pct":
-            if context_length and context_length > 0 and context_tokens >= 0:
-                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
-                parts.append(f"{pct}%")
-        elif field == "cwd":
-            rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
-            if rel:
-                parts.append(rel)
+        if counters is not None:
+            counter_fields = {
+                "api_calls": ("api", counters.api_calls),
+                "input_tokens": ("in", counters.input_tokens),
+                "output_tokens": ("out", counters.output_tokens),
+                "cache_read_tokens": ("cache", counters.cache_read_tokens),
+                "cache_write_tokens": ("cache+", counters.cache_write_tokens),
+                "reasoning_tokens": ("reason", counters.reasoning_tokens),
+                "tool_calls": ("tools", counters.tool_calls),
+            }
+            counter = counter_fields.get(field)
+            if counter is not None:
+                label, value = counter
+                if value is not None:
+                    parts.append(f"{label} {_compact_count(value)}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -126,10 +226,9 @@ def build_footer_line(
     *,
     user_config: dict[str, Any] | None,
     platform_key: str | None,
-    model: Optional[str],
-    context_tokens: int,
-    context_length: Optional[int],
-    cwd: Optional[str] = None,
+    db_path: str | os.PathLike[str] | None = None,
+    session_id: str | None = None,
+    execution: dict[str, Any] | None = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -140,10 +239,29 @@ def build_footer_line(
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
+    counters = read_local_session_counters(db_path, session_id)
+    if counters is None:
+        counters = _counters_from_execution(execution)
     return format_runtime_footer(
-        model=model,
-        context_tokens=context_tokens,
-        context_length=context_length,
-        cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        counters=counters,
     )
+
+
+def append_footer_for_delivery(
+    response: str,
+    footer: str,
+    *,
+    already_sent: bool,
+    intentional_silence: bool,
+) -> str:
+    """Append display chrome only when it can ride the existing final send.
+
+    Streaming surfaces have already delivered their body; returning it
+    unchanged deliberately suppresses the footer instead of creating a second
+    Telegram/Discord delivery. The caller's canonical response and history are
+    never accepted or mutated here.
+    """
+    if already_sent or intentional_silence or not response or not footer:
+        return response
+    return f"{response}\n\n{footer}"

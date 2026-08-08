@@ -1594,9 +1594,9 @@ display:
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
   turn_summary: true      # CLI only: print a one-line post-turn accounting footer after each interactive turn
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer
-  runtime_footer:         # Gateway: append a runtime-context footer to final replies
+  runtime_footer:         # Display-only CLI/final-gateway numeric telemetry
     enabled: false
-    fields: ["model", "context_pct", "cwd"]
+    fields: ["api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "tool_calls"]
   file_mutation_verifier: true    # Append an advisory footer when write_file/patch calls failed this turn
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
@@ -1696,26 +1696,30 @@ Tool progress requires a gateway adapter that can display progress updates safel
 
 Focus view is **display-only**. It never edits conversation history, the system prompt, tool schemas, or any request payload — hidden detail is suppressed on screen, never discarded, and prompt caching is completely unaffected.
 
-### Runtime-metadata footer (gateway only)
+### Runtime-metadata footer (display only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The current footer can show the model, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes prints a small footer after each interactive CLI turn and may append it to the **existing final** gateway delivery. By default it shows only identifier-free numeric counters already recorded in the local `state.db` or completed execution result. It is off by default.
+
+This footer is constructed after the model turn at the display/transport boundary. It is never sent to the provider, persisted in session history, or placed in prompt-cache content, and it performs no model call. On an already-streamed gateway response it is suppressed instead of sending a second Telegram/Discord message. Missing, locked, or older-schema databases fail soft and leave the answer unchanged. Only allow-listed numeric counters are read; session IDs and other database content are never rendered.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # supported fields: model, context_pct, cwd
+    fields: ["api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "tool_calls"]
 ```
+
+Supported fields are strictly limited to `api_calls`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, and `tool_calls`. Unknown or identifier-bearing fields are ignored. Per-platform overrides remain available under `display.platforms.<platform>.runtime_footer`.
 
 The `/footer` slash command toggles this at runtime in any session.
 
-Example footer appended to a Telegram/Discord/Slack reply:
+Example footer:
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+api 3 · in 12.3k · out 678 · cache 9.0k · tools 12
 ```
 
-Only the **final** message of a turn gets the footer; interim updates stay clean.
+Counters are session-cumulative because they come from the existing session row. Only the **final** display boundary gets the footer; interim updates and persisted transcripts stay clean.
 
 ### Per-platform progress overrides
 
