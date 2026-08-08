@@ -344,11 +344,56 @@ async def test_streamed_gateway_turn_never_sends_a_trailing_footer(
 
 
 @pytest.mark.asyncio
-async def test_active_goal_judge_receives_canonical_response_without_footer(
-    monkeypatch,
+async def test_active_goal_judge_receives_canonical_response_before_display_decoration(
+    monkeypatch, tmp_path
 ):
-    """Display telemetry must not enter the active goal judge provider prompt."""
+    """Reasoning and telemetry may be delivered, but never enter the goal judge."""
     import hermes_cli.goals as goals
+    import yaml
+    from hermes_state import SessionDB
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "display": {
+                    "show_reasoning": True,
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": ["api_calls", "input_tokens", "output_tokens"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    db.update_token_counts(
+        SESSION_ID,
+        input_tokens=111,
+        output_tokens=22,
+        api_call_count=1,
+        absolute=True,
+    )
+    db.flush_token_counts()
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner._goal_max_turns_from_config = lambda: 20
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "canonical answer",
+            "last_reasoning": "display-only reasoning",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "canonical answer"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "session_id": SESSION_ID,
+            "api_calls": 1,
+            "input_tokens": 111,
+            "output_tokens": 22,
+        }
+    )
 
     seen = {}
 
@@ -370,21 +415,20 @@ async def test_active_goal_judge_receives_canonical_response_without_footer(
 
     monkeypatch.setattr(goals, "GoalManager", FakeGoalManager)
     event = _event()
-    setattr(event, "_runtime_footer_canonical_response", "canonical answer")
-    runner = object.__new__(gateway_run.GatewayRunner)
-    runner._goal_max_turns_from_config = lambda: 20
-
-    final_response = runner._goal_response_for_result(
-        event,
-        "canonical answer\n\napi 1 · in 111 · out 22",
+    delivered_response = await runner._handle_message_with_agent(
+        event, _source(), SESSION_KEY, 1
     )
+    final_response = runner._goal_response_for_result(event, delivered_response)
     await runner._post_turn_goal_continuation(
         session_entry=types.SimpleNamespace(session_id=SESSION_ID),
         source=None,
         final_response=final_response,
     )
 
+    assert "display-only reasoning" in delivered_response
+    assert "api 1 · in 111 · out 22" in delivered_response
+    assert getattr(event, "_runtime_footer_canonical_response", None) == "canonical answer"
     assert seen["last_response"] == "canonical answer"
-    assert "api 1" not in seen["last_response"]
+    db.close()
 
 
