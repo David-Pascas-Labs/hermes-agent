@@ -16830,64 +16830,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_entry.session_id,
                     )
 
-            # Prepend reasoning/thinking if display is enabled (per-platform).
-            # Mattermost requires explicit per-platform opt-in because this is
-            # scratch text, not ordinary final-answer content.
-            try:
-                _show_reasoning_effective = _resolve_gateway_display_bool(
-                    _load_gateway_config(),
-                    _platform_config_key(source.platform),
-                    "show_reasoning",
-                    default=bool(getattr(self, "_show_reasoning", False)),
-                    platform=source.platform,
-                    require_platform_override_for={Platform.MATTERMOST},
-                )
-            except Exception:
-                _show_reasoning_effective = (
-                    False
-                    if source.platform == Platform.MATTERMOST
-                    else getattr(self, "_show_reasoning", False)
-                )
-            if _show_reasoning_effective and response and not _intentional_silence:
-                last_reasoning = agent_result.get("last_reasoning")
-                if last_reasoning:
-                    from gateway.stream_consumer import escape_code_fences_for_display
-                    # Collapse long reasoning to keep messages readable
-                    lines = last_reasoning.strip().splitlines()
-                    if len(lines) > 15:
-                        display_reasoning = "\n".join(lines[:15])
-                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
-                    else:
-                        display_reasoning = last_reasoning.strip()
-                    # Render style is per-platform: Discord defaults to "-# "
-                    # subtext (native small grey metadata text); other
-                    # platforms keep the fenced code block.
-                    try:
-                        from gateway.display_config import resolve_display_setting
-                        _reasoning_style = resolve_display_setting(
-                            _load_gateway_config(),
-                            _platform_config_key(source.platform),
-                            "reasoning_style",
-                            "code",
-                        )
-                    except Exception:
-                        _reasoning_style = "code"
-                    if _reasoning_style == "subtext":
-                        _quoted = "\n".join(
-                            f"-# {ln}" if ln else "-#" for ln in display_reasoning.splitlines()
-                        )
-                        response = f"-# 💭 Reasoning\n{_quoted}\n\n{response}"
-                    elif _reasoning_style == "blockquote":
-                        _quoted = "\n".join(
-                            f"> {ln}" if ln else ">" for ln in display_reasoning.splitlines()
-                        )
-                        response = f"> 💭 **Reasoning:**\n{_quoted}\n\n{response}"
-                    else:
-                        # Escape ``` inside reasoning so inner fences don't
-                        # break the outer code block used to render it.
-                        display_reasoning = escape_code_fences_for_display(display_reasoning)
-                        response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
-
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
@@ -17262,6 +17204,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 return None
 
+            # Keep display chrome separate from the canonical response consumed
+            # above by hooks, persistence, TTS, streaming media extraction, and
+            # goal evaluation. Only this non-streaming delivery value is decorated.
+            delivery_response = response
+
+            # Prepend reasoning/thinking if display is enabled (per-platform).
+            # Mattermost requires explicit per-platform opt-in because this is
+            # scratch text, not ordinary final-answer content.
+            try:
+                _show_reasoning_effective = _resolve_gateway_display_bool(
+                    _load_gateway_config(),
+                    _platform_config_key(source.platform),
+                    "show_reasoning",
+                    default=bool(getattr(self, "_show_reasoning", False)),
+                    platform=source.platform,
+                    require_platform_override_for={Platform.MATTERMOST},
+                )
+            except Exception:
+                _show_reasoning_effective = (
+                    False
+                    if source.platform == Platform.MATTERMOST
+                    else getattr(self, "_show_reasoning", False)
+                )
+            if (
+                _show_reasoning_effective
+                and delivery_response
+                and not _intentional_silence
+            ):
+                last_reasoning = agent_result.get("last_reasoning")
+                if last_reasoning:
+                    from gateway.stream_consumer import escape_code_fences_for_display
+
+                    # Collapse long reasoning to keep messages readable.
+                    lines = last_reasoning.strip().splitlines()
+                    if len(lines) > 15:
+                        display_reasoning = "\n".join(lines[:15])
+                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
+                    else:
+                        display_reasoning = last_reasoning.strip()
+                    # Render style is per-platform: Discord defaults to "-# "
+                    # subtext (native small grey metadata text); other
+                    # platforms keep the fenced code block.
+                    try:
+                        from gateway.display_config import resolve_display_setting
+
+                        _reasoning_style = resolve_display_setting(
+                            _load_gateway_config(),
+                            _platform_config_key(source.platform),
+                            "reasoning_style",
+                            "code",
+                        )
+                    except Exception:
+                        _reasoning_style = "code"
+                    if _reasoning_style == "subtext":
+                        _quoted = "\n".join(
+                            f"-# {ln}" if ln else "-#"
+                            for ln in display_reasoning.splitlines()
+                        )
+                        delivery_response = (
+                            f"-# 💭 Reasoning\n{_quoted}\n\n{delivery_response}"
+                        )
+                    elif _reasoning_style == "blockquote":
+                        _quoted = "\n".join(
+                            f"> {ln}" if ln else ">"
+                            for ln in display_reasoning.splitlines()
+                        )
+                        delivery_response = (
+                            f"> 💭 **Reasoning:**\n{_quoted}\n\n{delivery_response}"
+                        )
+                    else:
+                        # Escape ``` inside reasoning so inner fences don't
+                        # break the outer code block used to render it.
+                        display_reasoning = escape_code_fences_for_display(
+                            display_reasoning
+                        )
+                        delivery_response = (
+                            "💭 **Reasoning:**\n```\n"
+                            f"{display_reasoning}\n```\n\n{delivery_response}"
+                        )
+
             # Display-only runtime telemetry is constructed at the transport
             # boundary, after hooks, persistence, voice, and streaming have all
             # consumed the canonical response. It can therefore ride only this
@@ -17280,15 +17302,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id=agent_result.get("session_id") or session_entry.session_id,
                     execution=agent_result,
                 )
-                response = _append_footer(
-                    response,
+                delivery_response = _append_footer(
+                    delivery_response,
                     _footer_line,
                     already_sent=False,
                     intentional_silence=_intentional_silence,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
-            return response
+            return delivery_response
             
         except Exception as e:
             # Stop typing indicator on error too, retaining Slack thread/workspace
