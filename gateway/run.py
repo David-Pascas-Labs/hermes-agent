@@ -16869,27 +16869,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         display_reasoning = escape_code_fences_for_display(display_reasoning)
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
-            # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
-            _footer_line = ""
-            try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
-                )
-            except Exception as _footer_err:
-                logger.debug("runtime_footer build failed: %s", _footer_err)
-                _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
-                response = f"{response}\n\n{_footer_line}"
-
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
@@ -17262,23 +17241,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
-                    try:
-                        _foot_adapter = self._adapter_for_source(source)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            # Display-only runtime telemetry is constructed at the transport
+            # boundary, after hooks, persistence, voice, and streaming have all
+            # consumed the canonical response. It can therefore ride only this
+            # existing final send and can never enter model/session history.
+            try:
+                from gateway.runtime_footer import (
+                    append_footer_for_delivery as _append_footer,
+                    build_footer_line as _build_footer,
+                )
+
+                _state_store = getattr(self._session_db, "_db", self._session_db)
+                _footer_line = _build_footer(
+                    user_config=_load_gateway_config(),
+                    platform_key=_platform_config_key(source.platform),
+                    model=agent_result.get("model"),
+                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                    context_length=agent_result.get("context_length") or None,
+                    cwd=os.environ.get("TERMINAL_CWD", ""),
+                    db_path=getattr(_state_store, "db_path", None),
+                    session_id=agent_result.get("session_id") or session_entry.session_id,
+                    execution=agent_result,
+                )
+                response = _append_footer(
+                    response,
+                    _footer_line,
+                    already_sent=False,
+                    intentional_silence=_intentional_silence,
+                )
+            except Exception as _footer_err:
+                logger.debug("runtime_footer build failed: %s", _footer_err)
             return response
             
         except Exception as e:

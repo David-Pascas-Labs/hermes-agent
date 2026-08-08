@@ -3783,7 +3783,14 @@ class GatewaySlashCommandsMixin:
                 model=_resolve_gateway_model(user_config) or None,
                 context_tokens=0,
                 context_length=None,
-                fields=effective.get("fields") or ["model", "context_pct", "cwd"],
+                fields=effective.get("fields")
+                or [
+                    "api_calls",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "tool_calls",
+                ],
             )
             if preview:
                 example = t("gateway.footer.example_line", preview=preview)

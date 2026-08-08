@@ -1173,13 +1173,19 @@ DEFAULT_CONFIG = {
             "discord": {"streaming": False},
             "slack": {"streaming": False},
         },
-        # Gateway runtime-metadata footer appended to the FINAL message of a turn
-        # (disabled by default to keep replies minimal). When enabled, renders
-        # e.g. `model · 68% · ~/projects/hermes`. Per-platform overrides go under
-        # display.platforms.<platform>.runtime_footer.
+        # Display-only runtime footer for interactive CLI and the FINAL gateway
+        # delivery (disabled by default). Identifier-free numeric state.db /
+        # execution counters are rendered without a model call or history mutation.
+        # Per-platform overrides go under display.platforms.<platform>.runtime_footer.
         "runtime_footer": {
             "enabled": False,
-            "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
+            "fields": [
+                "api_calls",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "tool_calls",
+            ],
         },
         "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
         # Petdex animated mascot (https://github.com/crafter-station/petdex).
