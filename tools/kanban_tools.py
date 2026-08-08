@@ -135,6 +135,13 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+# These checks depend on ContextVars that distinguish a dispatcher-owned
+# parent from in-process cron/delegate children. Process-global TTL and
+# last-good caching would leak whichever context assembled tools first.
+setattr(_check_kanban_mode, "_hermes_context_dependent", True)
+setattr(_check_kanban_orchestrator_mode, "_hermes_context_dependent", True)
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
