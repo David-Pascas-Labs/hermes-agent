@@ -312,7 +312,7 @@ def _tool_search_additional_deferrable_names(
         return progressive_disclosure_builtin_tools(
             enabled_toolsets,
             platform=platform,
-            is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+            is_kanban_worker=_is_dispatcher_owned_worker(),
         )
     except Exception:
         return frozenset()

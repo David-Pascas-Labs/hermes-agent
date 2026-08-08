@@ -28,7 +28,6 @@ is left completely untouched.
 
 from __future__ import annotations
 
-import ast
 import os
 import threading
 
@@ -60,12 +59,20 @@ def worker_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestDispatcherOwnedPredicate:
-    def test_default_is_dispatcher_owned(self):
+    def test_default_without_worker_identity_is_not_dispatcher_owned(
+        self, monkeypatch
+    ):
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        assert is_dispatcher_owned_worker_context() is False
+
+    def test_worker_identity_is_dispatcher_owned(self, worker_env):
         from agent.delegation_context import is_dispatcher_owned_worker_context
 
         assert is_dispatcher_owned_worker_context() is True
 
-    def test_false_inside_non_dispatcher_context(self):
+    def test_false_inside_non_dispatcher_context(self, worker_env):
         from agent.delegation_context import (
             is_dispatcher_owned_worker_context,
             non_dispatcher_owned_context,
@@ -75,7 +82,7 @@ class TestDispatcherOwnedPredicate:
             assert is_dispatcher_owned_worker_context() is False
         assert is_dispatcher_owned_worker_context() is True
 
-    def test_token_form_restores(self):
+    def test_token_form_restores(self, worker_env):
         from agent.delegation_context import (
             enter_non_dispatcher_owned_context,
             exit_non_dispatcher_owned_context,
@@ -87,7 +94,7 @@ class TestDispatcherOwnedPredicate:
         exit_non_dispatcher_owned_context(token)
         assert is_dispatcher_owned_worker_context() is True
 
-    def test_nesting_restores_outer_value(self):
+    def test_nesting_restores_outer_value(self, worker_env):
         from agent.delegation_context import (
             is_dispatcher_owned_worker_context,
             non_dispatcher_owned_context,
@@ -173,6 +180,23 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert kanban_tools._default_task_id("t_explicit") == "t_explicit"
 
+    def test_worker_runtime_metadata_is_not_inherited(self, worker_env):
+        """Explicit tool args must not reactivate ambient worker ownership."""
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        metadata = {"source": "cron"}
+        with non_dispatcher_owned_context():
+            assert kanban_tools._worker_run_id("t_worker_real_task") is None
+            assert (
+                kanban_tools._stamp_worker_session_metadata(
+                    "t_worker_real_task", metadata
+                )
+                is metadata
+            )
+            assert kanban_tools._enforce_worker_task_ownership("t_other") is None
+            assert kanban_tools._require_orchestrator_tool("kanban_list") is None
+
     def test_skill_environment_gate(self, worker_env):
         from agent.delegation_context import non_dispatcher_owned_context
         import agent.skill_utils as su
@@ -205,6 +229,27 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert model_tools._is_dispatcher_owned_worker() is False
 
+    def test_tool_search_policy_does_not_treat_cron_as_worker(
+        self, monkeypatch, worker_env
+    ):
+        from agent.delegation_context import non_dispatcher_owned_context
+        import model_tools
+        import toolsets
+
+        observed = []
+
+        def policy(_enabled, *, platform, is_kanban_worker):
+            observed.append((platform, is_kanban_worker))
+            return frozenset()
+
+        monkeypatch.setattr(toolsets, "progressive_disclosure_builtin_tools", policy)
+
+        model_tools._tool_search_additional_deferrable_names([], platform="cron")
+        with non_dispatcher_owned_context():
+            model_tools._tool_search_additional_deferrable_names([], platform="cron")
+
+        assert observed == [("cron", True), ("cron", False)]
+
 
 # ---------------------------------------------------------------------------
 # run_job wiring
@@ -236,6 +281,9 @@ class TestRunJobKanbanIsolation:
 
             def get_activity_summary(self):
                 return {"seconds_since_activity": 0.0}
+
+            def close(self):
+                pass
 
         fake_mod = type(sys)("run_agent")
         fake_mod.AIAgent = agent_cls or FakeAgent
@@ -283,6 +331,30 @@ class TestRunJobKanbanIsolation:
         assert observed["dispatcher_owned_during_init"] is False
         assert observed["dispatcher_owned_during_run"] is False
 
+    def test_shared_scheduler_fire_path_keeps_cron_agent_isolated(
+        self, monkeypatch, worker_env
+    ):
+        """The ticker/provider path delegates to run_one_job -> run_job."""
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+        monkeypatch.setattr(sched, "claim_dispatch", lambda _job_id: True)
+        monkeypatch.setattr(sched, "mark_execution_running", lambda _execution_id: None)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_args: "/tmp/output")
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(sched, "finish_execution", lambda *_args, **_kwargs: None)
+
+        job = self._job("kanban-iso-scheduler")
+        job["execution_id"] = "exec-scheduler"
+        job["deliver"] = "local"
+
+        assert sched.run_one_job(job) is True
+        assert observed["dispatcher_owned_during_init"] is False
+        assert observed["dispatcher_owned_during_run"] is False
+        assert os.environ["HERMES_KANBAN_TASK"] == "t_worker_real_task"
+
     def test_environment_is_left_untouched(self, monkeypatch, worker_env):
         """The whole point of the ContextVar: os.environ must not be mutated, so
         the worker's claim heartbeat and the gateway watchers keep working."""
@@ -306,6 +378,57 @@ class TestRunJobKanbanIsolation:
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
         }
         assert after == before
+
+    def test_cron_child_subprocess_env_strips_all_worker_vars(
+        self, monkeypatch, worker_env
+    ):
+        """Terminal/CLI children of the cron agent must not regain identity."""
+        from agent.delegation_context import (
+            delegated_child_subprocess_env,
+            non_dispatcher_owned_context,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_BRANCH", "worker/branch")
+        monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+        monkeypatch.setenv("HERMES_KANBAN_FUTURE_IDENTITY", "must-not-leak")
+        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-home")
+        monkeypatch.setenv("HERMES_PROFILE", "cron-profile")
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("TERMINAL_CWD", "/tmp/cron-workdir")
+
+        with non_dispatcher_owned_context():
+            child_env = delegated_child_subprocess_env(dict(os.environ))
+
+        assert child_env is not None
+        assert not any(key.startswith("HERMES_KANBAN_") for key in child_env)
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in child_env
+        assert child_env["HERMES_HOME"] == "/tmp/profile-home"
+        assert child_env["HERMES_PROFILE"] == "cron-profile"
+        assert child_env["HERMES_CRON_SESSION"] == "1"
+        assert child_env["TERMINAL_CWD"] == "/tmp/cron-workdir"
+        assert os.environ["HERMES_KANBAN_TASK"] == "t_worker_real_task"
+        assert os.environ["HERMES_KANBAN_BOARD"] == "team-alpha"
+
+    def test_cron_terminal_env_strips_all_worker_vars(self, worker_env):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools.environments.local import _scrub_delegated_child_kanban_env
+
+        env = dict(os.environ)
+        with non_dispatcher_owned_context():
+            child_env = _scrub_delegated_child_kanban_env(env)
+
+        assert not any(key.startswith("HERMES_KANBAN_") for key in child_env)
+
+    def test_normal_session_subprocess_keeps_explicit_board(self, monkeypatch):
+        """Non-worker is not synonymous with child: preserve normal routing."""
+        from agent.delegation_context import delegated_child_subprocess_env
+        from tools.environments.local import _scrub_delegated_child_kanban_env
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        env = {"PATH": "/usr/bin", "HERMES_KANBAN_BOARD": "selected-board"}
+
+        assert delegated_child_subprocess_env(env) == env
+        assert _scrub_delegated_child_kanban_env(env) == env
 
     def test_context_reset_after_job(self, monkeypatch, worker_env):
         import cron.scheduler as sched
@@ -372,75 +495,3 @@ class TestRunJobKanbanIsolation:
             k: v for k, v in os.environ.items() if k.startswith("HERMES_KANBAN_")
         }
         assert after == before, "worker identity must survive concurrent cron jobs"
-
-
-# ---------------------------------------------------------------------------
-# Drift guard
-# ---------------------------------------------------------------------------
-
-def test_every_dispatcher_kanban_var_is_identity_gated():
-    """Invariant: every HERMES_KANBAN_* var the dispatcher injects is covered by
-    the canonical KANBAN_ENV_KEYS, so the delegate_task subprocess scrubber and
-    any future consumer stay in sync with ``_default_spawn``.
-
-    Fails loudly if a new dispatcher var is added without registering it.
-    """
-    import hermes_cli.kanban_db as kanban_db
-    from agent.delegation_context import KANBAN_ENV_KEYS
-
-    source = ast.parse(open(kanban_db.__file__, encoding="utf-8").read())
-    spawn = next(
-        node for node in ast.walk(source)
-        if isinstance(node, ast.FunctionDef) and node.name == "_default_spawn"
-    )
-
-    injected = set()
-    for node in ast.walk(spawn):
-        # env["HERMES_KANBAN_X"] = ...  and the annotated form
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if not isinstance(target, ast.Subscript):
-                    continue
-                if ast.unparse(target.value) != "env":
-                    continue
-                key = ast.unparse(target.slice).strip("\"'")
-                if key.startswith("HERMES_KANBAN_"):
-                    injected.add(key)
-        # env.update({"HERMES_KANBAN_X": ...}) / env.setdefault("HERMES_KANBAN_X", ...)
-        elif isinstance(node, ast.Call):
-            func = ast.unparse(node.func)
-            if func not in ("env.update", "env.setdefault"):
-                continue
-            literals = []
-            for arg in node.args:
-                if isinstance(arg, ast.Dict):
-                    literals.extend(
-                        k for k in arg.keys if isinstance(k, ast.Constant)
-                    )
-                elif isinstance(arg, ast.Constant):
-                    literals.append(arg)
-            for kw in node.keywords:
-                if kw.arg and kw.arg.startswith("HERMES_KANBAN_"):
-                    injected.add(kw.arg)
-            for lit in literals:
-                if isinstance(lit.value, str) and lit.value.startswith(
-                    "HERMES_KANBAN_"
-                ):
-                    injected.add(lit.value)
-
-    assert injected, "failed to parse dispatcher kanban env injection"
-
-    # These are worker-behaviour knobs rather than board/task identity; they are
-    # intentionally not part of KANBAN_ENV_KEYS. Listed explicitly so adding a
-    # new var forces a decision instead of silently passing.
-    behaviour_only = {
-        "HERMES_KANBAN_BRANCH",
-        "HERMES_KANBAN_GOAL_MODE",
-        "HERMES_KANBAN_GOAL_MAX_TURNS",
-    }
-    uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only
-    assert not uncovered, (
-        f"dispatcher injects {sorted(uncovered)} which is neither in "
-        "KANBAN_ENV_KEYS nor explicitly classified as behaviour-only"
-    )

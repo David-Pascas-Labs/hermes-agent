@@ -119,6 +119,22 @@ class TestKanbanWorkerGuidance:
         assert "Call `kanban_show()` first" in stable
         assert "kanban_complete" in stable
 
+    def test_cron_child_context_ignores_stale_worker_guidance(self, monkeypatch):
+        from agent.delegation_context import non_dispatcher_owned_context
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent_worker")
+        agent = _make_agent(
+            platform="cron",
+            valid_tool_names=["kanban_show", "kanban_complete"],
+            _kanban_worker_guidance=KANBAN_GUIDANCE,
+        )
+
+        with non_dispatcher_owned_context():
+            stable = _stable_prompt(agent)
+
+        assert "# Kanban task execution protocol" not in stable
+        assert "Call `kanban_show()` first" not in stable
+
 
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
