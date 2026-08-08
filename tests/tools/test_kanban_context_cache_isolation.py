@@ -169,3 +169,71 @@ def test_agent_child_warmup_does_not_hide_lifecycle_tools_from_parent(
 
     parent_names = _agent_kanban_names(platform="cli")
     assert KANBAN_LIFECYCLE_TOOLS <= parent_names
+
+
+@pytest.mark.parametrize("child_kind", ["cron", "delegate"])
+def test_child_does_not_run_parent_heartbeat(worker_env, child_kind, monkeypatch):
+    from tools import kanban_tools
+
+    monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", 0.0)
+    calls = {"connect": 0}
+
+    def unexpected_connect(*_args, **_kwargs):
+        calls["connect"] += 1
+        raise RuntimeError("must not be reached")
+
+    monkeypatch.setattr(kanban_tools, "_connect", unexpected_connect)
+
+    with _child_context(child_kind):
+        assert kanban_tools.heartbeat_current_worker_from_env() is False
+    assert calls["connect"] == 0
+
+
+@pytest.mark.parametrize("child_kind", ["cron", "delegate"])
+def test_child_does_not_poll_parent_operator_comments(
+    worker_env, child_kind, monkeypatch
+):
+    from tools import kanban_tools
+
+    monkeypatch.setattr(kanban_tools, "_comment_poll_last_attempt", 0.0)
+    calls = {"connect": 0}
+
+    def unexpected_connect(*_args, **_kwargs):
+        calls["connect"] += 1
+        raise RuntimeError("must not be reached")
+
+    monkeypatch.setattr(kanban_tools, "_connect", unexpected_connect)
+
+    class Agent:
+        def steer(self, _message):
+            raise AssertionError("child must not receive parent operator comments")
+
+    with _child_context(child_kind):
+        assert kanban_tools.inject_new_comments_from_env(Agent()) is False
+    assert calls["connect"] == 0
+
+
+@pytest.mark.parametrize("warmup_order", ["parent-first", "child-first"])
+@pytest.mark.parametrize("child_kind", ["cron", "delegate"])
+def test_send_message_worker_gate_is_context_local(
+    worker_env, child_kind, warmup_order, monkeypatch
+):
+    import gateway.session_context as session_context
+    import gateway.status as gateway_status
+    from tools import send_message_tool
+    from tools.registry import _check_fn_cached
+
+    monkeypatch.setattr(session_context, "get_session_env", lambda *_args: "")
+    monkeypatch.setattr(gateway_status, "is_gateway_running", lambda: False)
+
+    check = send_message_tool._check_send_message
+    assert getattr(check, "_hermes_context_dependent", False) is True
+
+    if warmup_order == "parent-first":
+        assert _check_fn_cached(check) is True
+        with _child_context(child_kind):
+            assert _check_fn_cached(check) is False
+    else:
+        with _child_context(child_kind):
+            assert _check_fn_cached(check) is False
+        assert _check_fn_cached(check) is True
