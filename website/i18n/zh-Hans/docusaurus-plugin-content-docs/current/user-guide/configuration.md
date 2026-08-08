@@ -1201,9 +1201,9 @@ display:
   show_cost: false        # 在 CLI 状态栏中显示估计 $ 成本
   timestamps: false       # 为 true 时，在 CLI/TUI 记录中为用户和 assistant 标签添加 [HH:MM] 时间戳前缀
   tool_preview_length: 0  # 工具调用预览的最大字符数（0 = 无限制，显示完整路径/命令）
-  runtime_footer:         # Gateway：在最终回复中附加运行时上下文页脚
+  runtime_footer:         # 仅显示用途的 CLI/最终 gateway 数值遥测
     enabled: false
-    fields: ["model", "context_pct", "cwd"]
+    fields: ["api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "tool_calls"]
   file_mutation_verifier: true    # 当本轮 write_file/patch 调用失败时附加建议性页脚
   language: en            # 静态消息的 UI 语言（审批提示、部分 gateway 回复）。en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
@@ -1245,26 +1245,30 @@ display:
 
 在 CLI 中，使用 `/verbose` 循环切换这些模式。要在消息平台（Telegram、Discord、Slack 等）中使用 `/verbose`，请在上方的 `display` 部分设置 `tool_progress_command: true`。该命令将循环切换模式并保存到配置。
 
-### 运行时元数据页脚（仅限 gateway）
+### 运行时元数据页脚（仅显示）
 
-当 `display.runtime_footer.enabled: true` 时，Hermes 在每个 gateway 轮次的**最终**消息中附加一个小型运行时上下文页脚。目前页脚可显示模型、上下文窗口百分比和当前工作目录。默认关闭；如果您的团队希望每个回复都包含这些来源信息，请按 gateway 选择加入。
+当 `display.runtime_footer.enabled: true` 时，Hermes 会在每个交互式 CLI 轮次后打印一个小型页脚，也可能将其附加到 gateway **现有的最终**消息中。默认只显示已经记录在本地 `state.db` 或已完成执行结果中的无标识符数值计数器。该功能默认关闭。
+
+页脚在模型轮次结束后、显示/传输边界处构造。它绝不会发送给 provider、持久化到会话历史或放入 prompt cache，也不会触发模型调用。对于已经流式发送的 gateway 回复，页脚会被抑制，而不是额外发送第二条 Telegram/Discord 消息。数据库缺失、被锁定或 schema 较旧时会软失败，并保持答案不变。只读取白名单中的数值计数器；会话 ID 和其他数据库内容绝不会被渲染出来。
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # 支持字段：model、context_pct、cwd
+    fields: ["api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "tool_calls"]
 ```
 
-`/footer` 斜杠命令在任何会话中运行时切换此功能。
+支持的字段严格限定为 `api_calls`、`input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens` 和 `tool_calls`。未知字段或包含标识符的字段都会被忽略。每平台覆盖仍可在 `display.platforms.<platform>.runtime_footer` 下配置。
 
-附加到 Telegram/Discord/Slack 回复的示例页脚：
+`/footer` 斜杠命令可在任意会话中运行时切换此功能。
+
+示例页脚：
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+api 3 · in 12.3k · out 678 · cache 9.0k · tools 12
 ```
 
-只有轮次的**最终**消息获得页脚；中间更新保持干净。
+这些计数器来自现有会话行，因此是会话累计值。只有**最终**显示边界会获得页脚；中间更新和持久化 transcript 始终保持干净。
 
 ### 每平台进度覆盖
 

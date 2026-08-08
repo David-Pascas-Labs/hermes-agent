@@ -222,7 +222,7 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
 async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
     monkeypatch, tmp_path
 ):
-    """The real gateway handler decorates only its returned delivery text."""
+    """Reasoning/footer decorate only delivery, never canonical consumers."""
     import yaml
     from hermes_state import SessionDB
 
@@ -230,6 +230,7 @@ async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
         yaml.safe_dump(
             {
                 "display": {
+                    "show_reasoning": True,
                     "runtime_footer": {
                         "enabled": True,
                         "fields": ["api_calls", "input_tokens", "output_tokens"],
@@ -255,10 +256,10 @@ async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "Hi there!",
-            "messages": [
-                {"role": "user", "content": "hello world"},
-                {"role": "assistant", "content": "Hi there!"},
-            ],
+            "last_reasoning": "display-only reasoning",
+            # Exercise the real no-new-messages transcript fallback. This is
+            # the seam that previously persisted display reasoning.
+            "messages": [],
             "tools": [],
             "history_offset": 0,
             "session_id": SESSION_ID,
@@ -273,7 +274,10 @@ async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
         event, _source(), SESSION_KEY, 1
     )
 
-    assert response == "Hi there!\n\napi 1 · in 111 · out 22"
+    assert response == (
+        "💭 **Reasoning:**\n```\ndisplay-only reasoning\n```\n\n"
+        "Hi there!\n\napi 1 · in 111 · out 22"
+    )
     assert getattr(event, "_runtime_footer_canonical_response", None) == "Hi there!"
     agent_end_events = [
         call.args[1]
@@ -282,13 +286,13 @@ async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
     ]
     assert len(agent_end_events) == 1
     assert agent_end_events[0]["response"] == "Hi there!"
-    assert "api 1" not in agent_end_events[0]["response"]
     assert runner._send_voice_reply.await_args.args[1] == "Hi there!"
-    persisted_contents = [
+    persisted_assistant_contents = [
         call.args[1].get("content")
         for call in runner.session_store.append_to_transcript.call_args_list
+        if call.args[1].get("role") == "assistant"
     ]
-    assert all("api 1" not in str(content) for content in persisted_contents)
+    assert persisted_assistant_contents == ["Hi there!"]
     db.close()
 
 
@@ -304,6 +308,7 @@ async def test_streamed_gateway_turn_never_sends_a_trailing_footer(
         yaml.safe_dump(
             {
                 "display": {
+                    "show_reasoning": True,
                     "runtime_footer": {"enabled": True, "fields": ["api_calls"]}
                 }
             }
@@ -320,7 +325,8 @@ async def test_streamed_gateway_turn_never_sends_a_trailing_footer(
     runner._deliver_media_from_response = AsyncMock()
     runner._run_agent = AsyncMock(
         return_value={
-            "final_response": "Hi there!",
+            "final_response": "Hi there!\nMEDIA:/tmp/canonical.png",
+            "last_reasoning": "display-only MEDIA:/tmp/decoy.png",
             "messages": [],
             "tools": [],
             "history_offset": 0,
@@ -335,6 +341,10 @@ async def test_streamed_gateway_turn_never_sends_a_trailing_footer(
     )
 
     assert response is None
+    assert runner._deliver_media_from_response.await_count == 1
+    assert runner._deliver_media_from_response.await_args_list[0].args[0] == (
+        "Hi there!\nMEDIA:/tmp/canonical.png"
+    )
     delivered_texts = [
         str(call.args[1] if len(call.args) > 1 else call.kwargs.get("content", ""))
         for call in adapter.send.await_args_list
