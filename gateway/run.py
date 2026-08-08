@@ -14910,6 +14910,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # MessageEvent objects can be replayed by internal queues. Clear any
+            # prior turn's delivery-only sidecar before invoking the agent.
+            setattr(event, "_runtime_footer_canonical_response", None)
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -14918,11 +14921,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # next turn makes more progress. Wrapped in try/except so a
             # broken judge never breaks normal message handling.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
+                _final_text = self._goal_response_for_result(event, _agent_result)
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
@@ -14963,6 +14962,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+
+    @staticmethod
+    def _goal_response_for_result(event: MessageEvent, agent_result: Any) -> str:
+        """Return canonical model text for goal evaluation, never delivery UI."""
+        if isinstance(agent_result, dict):
+            return str(agent_result.get("final_response") or "")
+        if isinstance(agent_result, str):
+            canonical = getattr(event, "_runtime_footer_canonical_response", None)
+            if isinstance(canonical, str):
+                return canonical
+            return agent_result
+        return ""
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -17254,6 +17265,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 _state_store = getattr(self._session_db, "_db", self._session_db)
+                # Preserve the canonical model response for post-turn consumers
+                # such as the active-goal judge. Only the returned delivery text
+                # below may contain the footer.
+                setattr(event, "_runtime_footer_canonical_response", response)
                 _footer_line = _build_footer(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),

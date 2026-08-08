@@ -268,11 +268,13 @@ async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
         }
     )
 
+    event = _event()
     response = await runner._handle_message_with_agent(
-        _event(), _source(), SESSION_KEY, 1
+        event, _source(), SESSION_KEY, 1
     )
 
     assert response == "Hi there!\n\napi 1 · in 111 · out 22"
+    assert getattr(event, "_runtime_footer_canonical_response", None) == "Hi there!"
     agent_end_events = [
         call.args[1]
         for call in runner.hooks.emit.await_args_list
@@ -339,5 +341,50 @@ async def test_streamed_gateway_turn_never_sends_a_trailing_footer(
     ]
     assert all("api 1" not in text for text in delivered_texts)
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_active_goal_judge_receives_canonical_response_without_footer(
+    monkeypatch,
+):
+    """Display telemetry must not enter the active goal judge provider prompt."""
+    import hermes_cli.goals as goals
+
+    seen = {}
+
+    class FakeGoalManager:
+        def __init__(self, *, session_id, default_max_turns):
+            seen["session_id"] = session_id
+            seen["max_turns"] = default_max_turns
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, last_response, **kwargs):
+            seen["last_response"] = last_response
+            return {
+                "message": "",
+                "should_continue": False,
+                "continuation_prompt": None,
+            }
+
+    monkeypatch.setattr(goals, "GoalManager", FakeGoalManager)
+    event = _event()
+    setattr(event, "_runtime_footer_canonical_response", "canonical answer")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._goal_max_turns_from_config = lambda: 20
+
+    final_response = runner._goal_response_for_result(
+        event,
+        "canonical answer\n\napi 1 · in 111 · out 22",
+    )
+    await runner._post_turn_goal_continuation(
+        session_entry=types.SimpleNamespace(session_id=SESSION_ID),
+        source=None,
+        final_response=final_response,
+    )
+
+    assert seen["last_response"] == "canonical answer"
+    assert "api 1" not in seen["last_response"]
 
 
