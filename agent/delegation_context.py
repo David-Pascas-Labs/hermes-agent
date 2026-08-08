@@ -34,16 +34,6 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
-KANBAN_ENV_KEYS: tuple[str, ...] = (
-    "HERMES_KANBAN_TASK",
-    "HERMES_KANBAN_RUN_ID",
-    "HERMES_KANBAN_WORKSPACE",
-    "HERMES_KANBAN_WORKSPACES_ROOT",
-    "HERMES_KANBAN_CLAIM_LOCK",
-    "HERMES_KANBAN_BOARD",
-    "HERMES_KANBAN_DB",
-)
-
 
 @contextmanager
 def delegated_child_context() -> Iterator[None]:
@@ -91,9 +81,23 @@ def is_dispatcher_owned_worker_context() -> bool:
     before trusting those vars.  False for delegate_task children and for cron
     jobs fired in-process from a worker.
     """
+    import os
+
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
     if _DELEGATED_CHILD_CONTEXT.get():
         return False
     return not _NON_DISPATCHER_OWNED_CONTEXT.get()
+
+
+def is_non_dispatcher_owned_context() -> bool:
+    """Return True only for a logically independent in-process child.
+
+    This is narrower than ``not is_dispatcher_owned_worker_context()``: a
+    normal CLI/gateway session is not a dispatcher worker either, but its
+    explicit board selection must still reach subprocesses.
+    """
+    return bool(_NON_DISPATCHER_OWNED_CONTEXT.get())
 
 
 def enter_non_dispatcher_owned_context() -> Token[bool]:
@@ -120,11 +124,25 @@ def is_delegated_child_process_context() -> bool:
     )
 
 
+def scrub_kanban_worker_env(
+    env: Mapping[str, str] | MutableMapping[str, str],
+) -> dict[str, str]:
+    """Return *env* without any ambient Kanban worker variables.
+
+    Cron children use this form: unlike a ``delegate_task`` child they are not
+    marked as delegated, but they must not reconstruct the parent worker's
+    identity from inherited ``HERMES_KANBAN_*`` variables.
+    """
+    return {
+        key: value
+        for key, value in dict(env).items()
+        if not key.startswith("HERMES_KANBAN_")
+    }
+
+
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
-    """Return *env* with dispatcher-only Kanban variables removed."""
-    cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
+    """Return *env* without Kanban variables and mark delegated lineage."""
+    cleaned = scrub_kanban_worker_env(env)
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 
@@ -132,20 +150,19 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
 def delegated_child_subprocess_env(
     env: Mapping[str, str] | MutableMapping[str, str] | None = None,
 ) -> dict[str, str] | None:
-    """Return an env override only when delegated-child lineage must cross fork.
+    """Scrub Kanban env for delegated or non-dispatcher-owned children.
 
-    Most subprocess call sites historically used ``env=None`` to inherit the
-    process environment.  In a ``delegate_task`` child, inheriting as-is leaks
-    parent dispatcher ``HERMES_KANBAN_*`` vars while losing the ContextVar in
-    the new process.  This helper preserves normal ``env=None`` semantics for
-    non-delegated calls, and only materializes a scrubbed env when the lineage
-    marker must be propagated across a child-process boundary.
+    ``None`` is preserved for ordinary subprocess callers so existing
+    inherit-the-process-environment behaviour is unchanged when no ambient
+    Kanban worker variables are present.
     """
-    if not is_delegated_child_process_context():
-        return None if env is None else dict(env)
+    import os
 
-    if env is None:
-        import os
-
-        env = os.environ
-    return scrub_kanban_env(env)
+    source = os.environ if env is None else env
+    if is_delegated_child_process_context():
+        return scrub_kanban_env(source)
+    if is_non_dispatcher_owned_context() and any(
+        key.startswith("HERMES_KANBAN_") for key in source
+    ):
+        return scrub_kanban_worker_env(source)
+    return None if env is None else dict(env)
