@@ -149,6 +149,12 @@ def _make_cli(**overrides):
         _turn_summary_collector = None
         _turn_summary_start = 0.0
         _turn_token_baseline = 0
+        _runtime_footer_config = {
+            "enabled": True,
+            "fields": ["api_calls", "input_tokens", "output_tokens", "cache_read_tokens"],
+        }
+        _last_turn_runtime_result = None
+        _session_db = None
         _spinner_text = "⚡ reading file"
         _tool_start_time = 0
 
@@ -156,6 +162,7 @@ def _make_cli(**overrides):
         _turn_summary_begin = cli_module.HermesCLI._turn_summary_begin
         _turn_summary_record = cli_module.HermesCLI._turn_summary_record
         _turn_summary_emit = cli_module.HermesCLI._turn_summary_emit
+        _runtime_footer_emit = cli_module.HermesCLI._runtime_footer_emit
         _spinner_token_flow = cli_module.HermesCLI._spinner_token_flow
         _render_spinner_text = cli_module.HermesCLI._render_spinner_text
 
@@ -195,6 +202,57 @@ def test_spinner_token_flow_appears_when_enabled():
     stub = _make_cli(agent=_StubAgent(session_output_tokens=1200))
     assert stub._spinner_token_flow() == "↓ 1.2k tok"
     assert "↓ 1.2k tok" in stub._render_spinner_text()
+
+
+def test_interactive_cli_runtime_footer_uses_existing_execution_result(monkeypatch):
+    import cli as cli_module
+
+    printed = []
+    monkeypatch.setattr(cli_module, "_cprint", lambda text: printed.append(text))
+    stub = _make_cli(
+        _last_turn_runtime_result={
+            "session_id": "private-session-id",
+            "api_calls": 2,
+            "input_tokens": 5000,
+            "output_tokens": 750,
+            "cache_read_tokens": 4200,
+            "final_response": "answer must not be touched",
+        }
+    )
+
+    stub._runtime_footer_emit()
+
+    assert len(printed) == 1
+    assert "api 2 · in 5.0k · out 750 · cache 4.2k" in printed[0]
+    assert "answer must not be touched" not in printed[0]
+    assert "private-session-id" not in printed[0]
+
+
+def test_cli_footer_toggle_updates_live_display_state(monkeypatch):
+    import cli as cli_module
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+    import hermes_cli.config as config_module
+
+    saved = []
+    printed = []
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {"display": {"runtime_footer": {"enabled": False}}},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "save_config_value",
+        lambda key, value: saved.append((key, value)) or True,
+    )
+    monkeypatch.setattr(cli_module, "_cprint", lambda text: printed.append(text))
+    stub = _make_cli(_runtime_footer_config={"enabled": False})
+
+    CLICommandsMixin._handle_footer_command(stub, "/footer on")
+
+    assert saved == [("display.runtime_footer.enabled", True)]
+    assert stub._runtime_footer_config == {"enabled": True}
+    assert len(printed) == 1
 
 
 

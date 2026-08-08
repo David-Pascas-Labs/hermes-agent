@@ -2835,7 +2835,13 @@ class CLICommandsMixin:
         cfg = load_config() or {}
         footer_cfg = ((cfg.get("display") or {}).get("runtime_footer") or {})
         current = bool(footer_cfg.get("enabled", False))
-        fields = footer_cfg.get("fields") or ["model", "context_pct", "cwd"]
+        fields = footer_cfg.get("fields") or [
+            "api_calls",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "tool_calls",
+        ]
 
         if arg in {"status", "?"}:
             state = "ON" if current else "OFF"
@@ -2856,6 +2862,11 @@ class CLICommandsMixin:
             return
 
         if save_config_value("display.runtime_footer.enabled", new_state):
+            # Keep the live interactive renderer in sync without a restart.
+            # This dict is display-only and is never passed to the agent.
+            live_cfg = dict(getattr(self, "_runtime_footer_config", {}) or {})
+            live_cfg["enabled"] = new_state
+            self._runtime_footer_config = live_cfg
             state = (
                 f"{_Colors.GREEN}ON{_Colors.RESET}" if new_state
                 else f"{_Colors.DIM}OFF{_Colors.RESET}"

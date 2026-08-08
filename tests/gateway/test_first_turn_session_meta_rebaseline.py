@@ -218,3 +218,126 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
     assert cached[0] is agent_obj
 
 
+@pytest.mark.asyncio
+async def test_runtime_footer_is_added_only_after_hooks_and_persistence(
+    monkeypatch, tmp_path
+):
+    """The real gateway handler decorates only its returned delivery text."""
+    import yaml
+    from hermes_state import SessionDB
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "display": {
+                    "runtime_footer": {
+                        "enabled": True,
+                        "fields": ["api_calls", "input_tokens", "output_tokens"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    db.update_token_counts(
+        SESSION_ID,
+        input_tokens=111,
+        output_tokens=22,
+        api_call_count=1,
+        absolute=True,
+    )
+    db.flush_token_counts()
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner._should_send_voice_reply = lambda *_a, **_kw: True
+    runner._send_voice_reply = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hi there!",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "Hi there!"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "session_id": SESSION_ID,
+            "api_calls": 1,
+            "input_tokens": 111,
+            "output_tokens": 22,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response == "Hi there!\n\napi 1 · in 111 · out 22"
+    agent_end_events = [
+        call.args[1]
+        for call in runner.hooks.emit.await_args_list
+        if call.args and call.args[0] == "agent:end"
+    ]
+    assert len(agent_end_events) == 1
+    assert agent_end_events[0]["response"] == "Hi there!"
+    assert "api 1" not in agent_end_events[0]["response"]
+    assert runner._send_voice_reply.await_args.args[1] == "Hi there!"
+    persisted_contents = [
+        call.args[1].get("content")
+        for call in runner.session_store.append_to_transcript.call_args_list
+    ]
+    assert all("api 1" not in str(content) for content in persisted_contents)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_streamed_gateway_turn_never_sends_a_trailing_footer(
+    monkeypatch, tmp_path
+):
+    """Already-delivered streaming returns without any footer delivery."""
+    import yaml
+    from hermes_state import SessionDB
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "display": {
+                    "runtime_footer": {"enabled": True, "fields": ["api_calls"]}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    adapter = MagicMock()
+    adapter._streaming_tts_turn_completed.return_value = False
+    adapter.send = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    runner._deliver_media_from_response = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hi there!",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "session_id": SESSION_ID,
+            "api_calls": 1,
+            "already_sent": True,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), SESSION_KEY, 1
+    )
+
+    assert response is None
+    delivered_texts = [
+        str(call.args[1] if len(call.args) > 1 else call.kwargs.get("content", ""))
+        for call in adapter.send.await_args_list
+    ]
+    assert all("api 1" not in text for text in delivered_texts)
+    db.close()
+
+

@@ -4312,6 +4312,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._turn_summary_collector = None
         self._turn_summary_start = 0.0
         self._turn_token_baseline = 0
+        _runtime_footer_config = CLI_CONFIG["display"].get("runtime_footer")
+        self._runtime_footer_config = (
+            dict(_runtime_footer_config)
+            if isinstance(_runtime_footer_config, dict)
+            else {}
+        )
+        self._last_turn_runtime_result = None
         # True only while an interactive (run()-loop) turn is in flight. Single
         # query, -Q, and gateway paths never set it, which is what keeps the
         # summary line out of non-interactive surfaces.
@@ -5577,6 +5584,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  {_DIM}{line}{_RST}")
         except Exception:
             logger.debug("Turn summary render failed", exc_info=True)
+
+    def _runtime_footer_emit(self) -> None:
+        """Print local runtime telemetry as terminal chrome after a turn."""
+        if not getattr(self, "_interactive_turn", False):
+            return
+        result = getattr(self, "_last_turn_runtime_result", None)
+        if not isinstance(result, dict):
+            return
+        agent = getattr(self, "agent", None)
+        if agent is not None and getattr(agent, "quiet_mode", False):
+            return
+        try:
+            from gateway.runtime_footer import build_footer_line
+
+            state_store = getattr(self._session_db, "_db", self._session_db)
+            line = build_footer_line(
+                user_config={
+                    "display": {
+                        "runtime_footer": getattr(self, "_runtime_footer_config", {})
+                    }
+                },
+                platform_key="terminal",
+                db_path=getattr(state_store, "db_path", None),
+                session_id=result.get("session_id") or getattr(self, "session_id", None),
+                execution=result,
+            )
+            if line:
+                _cprint(f"  {_DIM}{line}{_RST}")
+        except Exception:
+            logger.debug("Runtime footer render failed", exc_info=True)
 
     # ── Petdex mascot (base-CLI pet pane) ───────────────────────────────
     #
@@ -13867,6 +13904,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            # Retain only the allow-listed local counters/lookup fields needed
+            # by display chrome. Response text, history, and arbitrary execution
+            # metadata are dropped and never passed back into run_conversation.
+            from gateway.runtime_footer import project_execution_footer_state
+
+            _footer_state = project_execution_footer_state(result)
+            self._last_turn_runtime_result = _footer_state or None
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -16936,6 +16980,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Regular chat - run agent
                     self._agent_running = True
                     self._interactive_turn = True
+                    # Never reuse a prior turn's counters if this turn fails
+                    # before run_conversation returns a fresh result.
+                    self._last_turn_runtime_result = None
                     self._pet_turn_error = False
                     self._pet_reasoning = False
                     self._turn_summary_begin()
@@ -16955,6 +17002,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # Emitted after the response box, before the prompt
                         # returns, so it reads as a footer for the turn.
                         self._turn_summary_emit()
+                        self._runtime_footer_emit()
                         self._interactive_turn = False
 
                         app.invalidate()  # Refresh status line
