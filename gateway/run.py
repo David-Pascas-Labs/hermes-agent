@@ -16788,6 +16788,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
 
+            # Preserve the canonical post-filter model response before any
+            # display-only reasoning or runtime-footer decoration is applied.
+            setattr(
+                event,
+                "_runtime_footer_canonical_response",
+                "" if _intentional_silence else response,
+            )
+
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
             # If the agent's session_id changed during compression, update
@@ -17265,10 +17273,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 _state_store = getattr(self._session_db, "_db", self._session_db)
-                # Preserve the canonical model response for post-turn consumers
-                # such as the active-goal judge. Only the returned delivery text
-                # below may contain the footer.
-                setattr(event, "_runtime_footer_canonical_response", response)
                 _footer_line = _build_footer(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
