@@ -2889,6 +2889,7 @@ def terminal_tool(
             # run. Plugins may replace that bounded string; replacements are
             # still subject to the final output limit below.
             # The hook is fail-open, and the first valid string return wins.
+            terminal_output_transformed = False
             try:
                 from hermes_cli.lifecycle import invoke_hook
                 hook_results = invoke_hook(
@@ -2902,6 +2903,7 @@ def terminal_tool(
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
                         output = hook_result
+                        terminal_output_transformed = True
                         break
             except Exception:
                 pass
@@ -2910,7 +2912,7 @@ def terminal_tool(
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
-                if not spill_file_path:
+                if terminal_output_transformed or not spill_file_path:
                     # Whole-result transports and output-transform hooks reach
                     # this seam with the complete model-facing string in memory.
                     # Preserve that exact pre-truncation contract for retrieval.
@@ -2962,7 +2964,30 @@ def terminal_tool(
                 )
 
                 sanitized_spill_path = None
-                if spill_file_path and _is_safe_terminal_spill_path(spill_file_path):
+                if terminal_output_transformed and whole_result_output is None:
+                    # A hook replaced a large raw stream with a bounded public
+                    # result. The raw collector spill is no longer part of the
+                    # model-facing contract and must not be published or kept.
+                    if spill_file_path:
+                        _delete_private_terminal_spill(spill_file_path)
+                elif whole_result_output is not None:
+                    spill_total_chars = len(whole_result_output)
+                    sanitized_spill = redact_terminal_output(
+                        strip_ansi(whole_result_output), command
+                    )
+                    if spill_file_path and _is_safe_terminal_spill_path(
+                        spill_file_path
+                    ):
+                        sanitized_spill_path = _replace_private_terminal_spill(
+                            spill_file_path, sanitized_spill
+                        )
+                        if sanitized_spill_path is None:
+                            _delete_private_terminal_spill(spill_file_path)
+                    else:
+                        sanitized_spill_path = _write_private_terminal_spill(
+                            sanitized_spill
+                        )
+                elif spill_file_path and _is_safe_terminal_spill_path(spill_file_path):
                     raw_spill = Path(spill_file_path).read_text(
                         encoding="utf-8", errors="replace"
                     )
@@ -2986,17 +3011,6 @@ def terminal_tool(
                     )
                     if sanitized_spill_path is None:
                         _delete_private_terminal_spill(spill_file_path)
-                elif (
-                    whole_result_output is not None
-                    and len(whole_result_output) > MAX_OUTPUT_CHARS
-                ):
-                    spill_total_chars = len(whole_result_output)
-                    sanitized_spill = redact_terminal_output(
-                        strip_ansi(whole_result_output), command
-                    )
-                    sanitized_spill_path = _write_private_terminal_spill(
-                        sanitized_spill
-                    )
 
                 if sanitized_spill_path:
                     result_dict["output_total_chars"] = spill_total_chars

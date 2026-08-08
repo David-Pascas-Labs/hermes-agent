@@ -94,6 +94,48 @@ class TestTruncationSpill:
         full = Path(r["full_output_path"]).read_text()
         assert full == full_output
 
+    def test_transform_hook_replacement_owns_spill_contract(
+        self, small_cap, monkeypatch
+    ):
+        """A hook replacement, not the raw process stream, is recoverable."""
+        transformed = "hook_head\n" + ("h" * 10_000) + "\nhook_tail"
+
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: [transformed]
+            if hook_name == "transform_terminal_output"
+            else [],
+        )
+
+        r = json.loads(terminal_tool(
+            "python3 -c \"print('raw_head'); "
+            "[print('raw', 'x'*90) for i in range(200)]; print('raw_tail')\"",
+            task_id="t-spill-hook"))
+
+        assert r["output_total_chars"] == len(transformed)
+        assert len(r["output"]) <= 2100
+        assert Path(r["full_output_path"]).read_text() == transformed
+
+    def test_small_transform_hook_replacement_discards_raw_spill(
+        self, small_cap, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: ["small replacement"]
+            if hook_name == "transform_terminal_output"
+            else [],
+        )
+
+        r = json.loads(terminal_tool(
+            "python3 -c \"[print('raw', 'x'*90) for i in range(200)]\"",
+            task_id="t-spill-hook-small"))
+
+        assert r["output"] == "small replacement"
+        assert "full_output_path" not in r
+        assert "output_total_chars" not in r
+        spill_dir = small_cap / ".hermes" / "cache" / "terminal-output"
+        assert list(spill_dir.glob("out-*.log")) == []
+
     def test_spill_remains_lossless_beyond_upstream_five_megabyte_cap(
         self, small_cap
     ):
