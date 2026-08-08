@@ -2856,8 +2856,17 @@ def terminal_tool(
             record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
+            if result is None:
+                raise RuntimeError("terminal environment returned no result")
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
+            # BaseEnvironment streams overflow to disk. Whole-result transports
+            # (managed Modal and similar RPC backends) bypass that collector, so
+            # retain their raw result only until the common sanitizer can create
+            # the same host-side spill below.
+            spill_total_chars = result.get("output_total_chars")
+            spill_file_path = result.get("full_output_path")
+            whole_result_output = None
 
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
@@ -2901,6 +2910,11 @@ def terminal_tool(
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
+                if not spill_file_path:
+                    # Whole-result transports and output-transform hooks reach
+                    # this seam with the complete model-facing string in memory.
+                    # Preserve that exact pre-truncation contract for retrieval.
+                    whole_result_output = output
                 head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
                 tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
                 omitted = len(output) - head_chars - tail_chars
@@ -2936,6 +2950,75 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            # Recoverable truncation: sanitize the full stream before exposing
+            # its handle. Never trust a backend-provided path; only owner-only
+            # files inside this active profile's spill directory are accepted.
+            try:
+                from tools.environments.base import (
+                    _delete_private_terminal_spill,
+                    _is_safe_terminal_spill_path,
+                    _replace_private_terminal_spill,
+                    _write_private_terminal_spill,
+                )
+
+                sanitized_spill_path = None
+                if spill_file_path and _is_safe_terminal_spill_path(spill_file_path):
+                    raw_spill = Path(spill_file_path).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    # Remote/local wrappers may append the private CWD marker
+                    # after command output. The visible result already strips
+                    # it in env.execute(); keep the recoverable full stream on
+                    # the same public contract rather than leaking internals.
+                    spill_result = {"output": raw_spill}
+                    strip_cwd_marker = getattr(
+                        env, "_extract_cwd_from_output", None
+                    )
+                    if callable(strip_cwd_marker):
+                        strip_cwd_marker(spill_result)
+                        raw_spill = spill_result["output"]
+                        spill_total_chars = len(raw_spill)
+                    sanitized_spill = redact_terminal_output(
+                        strip_ansi(raw_spill), command
+                    )
+                    sanitized_spill_path = _replace_private_terminal_spill(
+                        spill_file_path, sanitized_spill
+                    )
+                    if sanitized_spill_path is None:
+                        _delete_private_terminal_spill(spill_file_path)
+                elif (
+                    whole_result_output is not None
+                    and len(whole_result_output) > MAX_OUTPUT_CHARS
+                ):
+                    spill_total_chars = len(whole_result_output)
+                    sanitized_spill = redact_terminal_output(
+                        strip_ansi(whole_result_output), command
+                    )
+                    sanitized_spill_path = _write_private_terminal_spill(
+                        sanitized_spill
+                    )
+
+                if sanitized_spill_path:
+                    result_dict["output_total_chars"] = spill_total_chars
+                    result_dict["full_output_path"] = sanitized_spill_path
+                    result_dict["truncation_note"] = (
+                        "Output exceeded the capture window (head+tail shown). "
+                        f"Full output ({spill_total_chars:,} chars) saved to "
+                        f"{sanitized_spill_path} — search it with search_files or "
+                        "page it with read_file instead of re-running the command."
+                    )
+            except Exception:
+                logger.debug(
+                    "terminal spill sanitization failed; dropping spill handle",
+                    exc_info=True,
+                )
+                if spill_file_path:
+                    try:
+                        from tools.environments.base import _delete_private_terminal_spill
+
+                        _delete_private_terminal_spill(spill_file_path)
+                    except Exception:
+                        pass
             try:
                 from agent.verification_evidence import record_terminal_result
 

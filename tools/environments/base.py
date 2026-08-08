@@ -12,7 +12,9 @@ import logging
 import os
 import select
 import shlex
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -49,11 +51,169 @@ _activity_callback_local = threading.local()
 # enough that the collector never evicts in practice, keeping a single code
 # path for both bounded and unbounded modes.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
+_TERMINAL_SPILL_RETENTION_SECONDS = 7 * 86400
+
+
+def _terminal_spill_dir(*, create: bool) -> Path | None:
+    """Return the profile-scoped spill directory without following escapes."""
+    try:
+        home = get_hermes_home().expanduser().resolve()
+        cache_dir = home / "cache"
+        if create:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        elif not cache_dir.is_dir():
+            return None
+
+        resolved_cache = cache_dir.resolve()
+        resolved_cache.relative_to(home)
+        spill_dir = resolved_cache / "terminal-output"
+        if create:
+            spill_dir.mkdir(mode=0o700, exist_ok=True)
+        elif not spill_dir.is_dir():
+            return None
+
+        # A writable symlink here would let a compromised profile redirect
+        # terminal output outside its own home. Reject it rather than follow it.
+        if spill_dir.is_symlink():
+            return None
+        resolved_spill = spill_dir.resolve()
+        resolved_spill.relative_to(home)
+        if os.name != "nt":
+            os.chmod(resolved_spill, 0o700)
+        return resolved_spill
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _cleanup_terminal_spills(spill_dir: Path) -> None:
+    """Opportunistically remove only our own spill entries after seven days."""
+    cutoff = time.time() - _TERMINAL_SPILL_RETENTION_SECONDS
+    try:
+        candidates = spill_dir.glob("out-*.log")
+        for old in candidates:
+            try:
+                # lstat avoids following a malicious symlink during cleanup.
+                if old.lstat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _open_private_terminal_spill() -> tuple[IO[str], Path] | None:
+    """Create an unpredictable, owner-only spill file in the active profile."""
+    spill_dir = _terminal_spill_dir(create=True)
+    if spill_dir is None:
+        return None
+    _cleanup_terminal_spills(spill_dir)
+    try:
+        fh = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            errors="replace",
+            prefix="out-",
+            suffix=".log",
+            dir=spill_dir,
+            delete=False,
+        )
+        path = Path(fh.name)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        return fh, path
+    except OSError:
+        return None
+
+
+def _is_safe_terminal_spill_path(path: str | os.PathLike[str]) -> bool:
+    """Validate an environment-supplied spill handle before reading it."""
+    spill_dir = _terminal_spill_dir(create=False)
+    if spill_dir is None:
+        return False
+    try:
+        candidate = Path(path)
+        if candidate.is_symlink():
+            return False
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != spill_dir or not resolved.name.startswith("out-"):
+            return False
+        if not resolved.name.endswith(".log"):
+            return False
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        if os.name != "nt":
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                return False
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _write_private_terminal_spill(text: str) -> str | None:
+    """Persist already-sanitized whole-result output for non-streaming backends."""
+    opened = _open_private_terminal_spill()
+    if opened is None:
+        return None
+    fh, path = opened
+    try:
+        fh.write(text)
+        fh.close()
+        return str(path) if _is_safe_terminal_spill_path(path) else None
+    except OSError:
+        try:
+            fh.close()
+        except OSError:
+            pass
+        try:
+            if _is_safe_terminal_spill_path(path):
+                path.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _replace_private_terminal_spill(path: str, text: str) -> str | None:
+    """Atomically replace a validated raw spill with sanitized content."""
+    if not _is_safe_terminal_spill_path(path):
+        return None
+    opened = _open_private_terminal_spill()
+    if opened is None:
+        return None
+    fh, replacement = opened
+    try:
+        fh.write(text)
+        fh.close()
+        os.replace(replacement, path)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        return path if _is_safe_terminal_spill_path(path) else None
+    except OSError:
+        try:
+            fh.close()
+        except OSError:
+            pass
+        try:
+            if _is_safe_terminal_spill_path(replacement):
+                replacement.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _delete_private_terminal_spill(path: str) -> None:
+    """Delete a spill only after validating that it belongs to this profile."""
+    try:
+        if _is_safe_terminal_spill_path(path):
+            Path(path).unlink()
+    except OSError:
+        pass
 
 
 class _BoundedOutputCollector:
-    """Retain a bounded 40/60 head-tail window of streamed text."""
-    def __init__(self, max_chars: int):
+    """Retain a bounded preview and optionally tee overflow losslessly to disk."""
+
+    def __init__(self, max_chars: int, *, spill_enabled: bool = False):
         self.max_chars = max(1, int(max_chars))
         self._head_limit = int(self.max_chars * 0.4)
         self._tail_limit = self.max_chars - self._head_limit
@@ -63,6 +223,63 @@ class _BoundedOutputCollector:
         self._tail_chars = 0
         self._total_chars = 0
         self._lock = threading.Lock()
+        self._spill_enabled = spill_enabled
+        self._spill_fh: IO[str] | None = None
+        self._spill_path: Path | None = None
+        self._spill_failed = False
+
+    def _maybe_spill(self, text: str) -> None:
+        """Tee ``text`` to a private file, backfilling the retained prefix."""
+        if not self._spill_enabled or self._spill_failed:
+            return
+        try:
+            if self._spill_fh is None:
+                opened = _open_private_terminal_spill()
+                if opened is None:
+                    self._spill_failed = True
+                    return
+                self._spill_fh, self._spill_path = opened
+                self._spill_fh.write("".join(self._head) + "".join(self._tail))
+            self._spill_fh.write(text)
+        except OSError:
+            self.discard_spill(_already_locked=True)
+            self._spill_failed = True
+
+    def close_spill(self) -> str | None:
+        """Close the spill and return its validated path when it was used."""
+        with self._lock:
+            if self._spill_fh is None or self._spill_path is None:
+                return None
+            try:
+                self._spill_fh.close()
+            except OSError:
+                pass
+            self._spill_fh = None
+            path = str(self._spill_path)
+            return path if _is_safe_terminal_spill_path(path) else None
+
+    def discard_spill(self, *, _already_locked: bool = False) -> None:
+        """Close and unlink an unusable raw spill without following symlinks."""
+        def _discard() -> None:
+            if self._spill_fh is not None:
+                try:
+                    self._spill_fh.close()
+                except OSError:
+                    pass
+                self._spill_fh = None
+            if self._spill_path is not None:
+                try:
+                    if _is_safe_terminal_spill_path(self._spill_path):
+                        self._spill_path.unlink()
+                except OSError:
+                    pass
+                self._spill_path = None
+
+        if _already_locked:
+            _discard()
+        else:
+            with self._lock:
+                _discard()
 
     @property
     def buffered_chars(self) -> int:
@@ -79,6 +296,11 @@ class _BoundedOutputCollector:
             return
         with self._lock:
             text_len = len(text)
+            if self._spill_enabled and (
+                self._spill_fh is not None
+                or self._total_chars + text_len > self.max_chars
+            ):
+                self._maybe_spill(text)
             self._total_chars += text_len
             start = 0
 
@@ -775,7 +997,10 @@ class BaseEnvironment(ABC):
             # segment, no eviction) so behavior matches the historical
             # accumulate-everything semantics.
             capture_limit = _UNBOUNDED_CAPTURE_CHARS
-        output = _BoundedOutputCollector(capture_limit)
+        output = _BoundedOutputCollector(
+            capture_limit,
+            spill_enabled=bounded_capture,
+        )
 
         # Non-blocking drain via select().
         #
@@ -942,10 +1167,11 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
-                    return {
-                        "output": output.render(suffix="\n[Command interrupted]"),
-                        "returncode": 130,
-                    }
+                    return self._finalize_wait_result(
+                        output,
+                        output.render(suffix="\n[Command interrupted]"),
+                        130,
+                    )
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
                         logger.info(
@@ -956,12 +1182,13 @@ class BaseEnvironment(ABC):
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
-                    return {
-                        "output": output.render(suffix=timeout_msg).lstrip()
+                    return self._finalize_wait_result(
+                        output,
+                        output.render(suffix=timeout_msg).lstrip()
                         if output.total_chars == 0
                         else output.render(suffix=timeout_msg),
-                        "returncode": 124,
-                    }
+                        124,
+                    )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
 
@@ -1014,6 +1241,7 @@ class BaseEnvironment(ABC):
                 drain_thread.join(timeout=2)
             except Exception:
                 pass  # cleanup is best-effort
+            output.discard_spill()
             raise
 
         # Drain thread now exits promptly after bash does (~300ms idle
@@ -1035,7 +1263,21 @@ class BaseEnvironment(ABC):
                 proc.returncode,
             )
 
-        return {"output": output.render(), "returncode": proc.returncode}
+        return self._finalize_wait_result(output, output.render(), proc.returncode)
+
+    @staticmethod
+    def _finalize_wait_result(
+        collector: "_BoundedOutputCollector",
+        rendered: str,
+        returncode: int | None,
+    ) -> dict:
+        """Attach pre-truncation size and a recoverable spill handle."""
+        result = {"output": rendered, "returncode": returncode}
+        spill = collector.close_spill()
+        if spill:
+            result["output_total_chars"] = collector.total_chars
+            result["full_output_path"] = spill
+        return result
 
     def _kill_process(self, proc: ProcessHandle):
         """Terminate a process. Subclasses may override for process-group kill."""
