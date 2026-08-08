@@ -55,6 +55,8 @@ class TestTruncationSpill:
         p = Path(r["full_output_path"])
         full = p.read_text()
         assert "a1B2c3D4e5F6g7H8i9J0a1B2c3D4e5F6g7H8i9J0" not in full
+        assert r["output_total_chars"] == len(full)
+        assert f"Full output ({len(full):,} chars)" in r["truncation_note"]
 
     def test_old_spills_cleaned(self, small_cap, tmp_path):
         spill_dir = tmp_path / ".hermes" / "cache" / "terminal-output"
@@ -180,6 +182,36 @@ class TestTruncationSpill:
         assert victim.read_text() == "do-not-touch"
         assert "full_output_path" not in r
         assert "output_total_chars" not in r
+
+    def test_large_whole_result_with_untrusted_path_gets_safe_host_spill(
+        self, small_cap, monkeypatch, tmp_path
+    ):
+        terminal_module = importlib.import_module("tools.terminal_tool")
+        victim = tmp_path / "outside-victim.log"
+        victim.write_text("do-not-touch")
+        full_output = "remote_head\n" + ("r" * 10_000) + "\nremote_tail"
+
+        class UntrustedPathEnv:
+            cwd = str(small_cap)
+
+            def execute(self, command, **kwargs):
+                return {
+                    "output": full_output,
+                    "returncode": 0,
+                    "output_total_chars": len(full_output),
+                    "full_output_path": str(victim),
+                }
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setitem(
+            terminal_module._active_environments, "default", UntrustedPathEnv()
+        )
+
+        r = json.loads(terminal_tool("printf safe", task_id="t-spill-untrusted-large"))
+
+        assert victim.read_text() == "do-not-touch"
+        assert r["output_total_chars"] == len(full_output)
+        assert Path(r["full_output_path"]).read_text() == full_output
 
     @pytest.mark.skipif(os.name == "nt", reason="symlink permissions vary on Windows")
     def test_profile_cache_symlink_escape_fails_closed(

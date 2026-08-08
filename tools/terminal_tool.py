@@ -2866,6 +2866,19 @@ def terminal_tool(
             # the same host-side spill below.
             spill_total_chars = result.get("output_total_chars")
             spill_file_path = result.get("full_output_path")
+            spill_file_path_is_safe = False
+            if spill_file_path:
+                try:
+                    from tools.environments.base import _is_safe_terminal_spill_path
+
+                    spill_file_path_is_safe = _is_safe_terminal_spill_path(
+                        spill_file_path
+                    )
+                except Exception:
+                    logger.debug(
+                        "terminal backend spill path validation failed",
+                        exc_info=True,
+                    )
             whole_result_output = None
 
             # Add helpful message for sudo failures in messaging context
@@ -2912,7 +2925,7 @@ def terminal_tool(
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
-                if terminal_output_transformed or not spill_file_path:
+                if terminal_output_transformed or not spill_file_path_is_safe:
                     # Whole-result transports and output-transform hooks reach
                     # this seam with the complete model-facing string in memory.
                     # Preserve that exact pre-truncation contract for retrieval.
@@ -2971,10 +2984,10 @@ def terminal_tool(
                     if spill_file_path:
                         _delete_private_terminal_spill(spill_file_path)
                 elif whole_result_output is not None:
-                    spill_total_chars = len(whole_result_output)
                     sanitized_spill = redact_terminal_output(
                         strip_ansi(whole_result_output), command
                     )
+                    spill_total_chars = len(sanitized_spill)
                     if spill_file_path and _is_safe_terminal_spill_path(
                         spill_file_path
                     ):
@@ -3006,6 +3019,7 @@ def terminal_tool(
                     sanitized_spill = redact_terminal_output(
                         strip_ansi(raw_spill), command
                     )
+                    spill_total_chars = len(sanitized_spill)
                     sanitized_spill_path = _replace_private_terminal_spill(
                         spill_file_path, sanitized_spill
                     )
