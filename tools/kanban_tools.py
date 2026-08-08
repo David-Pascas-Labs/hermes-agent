@@ -424,13 +424,241 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     }
 
 
+_KANBAN_SHOW_COMPACT_MAX_CHARS = 30_000
+_KANBAN_SHOW_COMPACT_COMMENT_CHARS = 2 * 1024
+_KANBAN_SHOW_FALLBACK_PREVIEW_CHARS = 512
+_KANBAN_SHOW_COMPACT_TASK_FIELDS = (
+    "id",
+    "title",
+    "assignee",
+    "status",
+    "tenant",
+    "priority",
+    "workspace_kind",
+    "workspace_path",
+    "current_run_id",
+    "model_override",
+    "provider_override",
+)
+
+
+def _compact_cap_text(value: Optional[str], limit: int) -> str:
+    """Mirror ``build_worker_context``'s visible per-field truncation."""
+    if not value:
+        return ""
+    text = str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"… [truncated, {len(text) - limit} chars omitted]"
+
+
+def _compact_full_hint(task_id: str) -> str:
+    if len(task_id) <= _KANBAN_SHOW_FALLBACK_PREVIEW_CHARS:
+        return (
+            f'Call kanban_show(mode="full", task_id="{task_id}") for canonical '
+            "full tool output; use kanban_attachments for the full manifest."
+        )
+    return (
+        "Call kanban_show(mode=\"full\") again with the exact original task_id "
+        f"({len(task_id)} characters) for canonical full tool output; use "
+        "kanban_attachments for the full manifest."
+    )
+
+
+def _compact_show_error(message: str, task_id: str) -> str:
+    return json.dumps(
+        {
+            "error": _compact_cap_text(message, 2 * 1024),
+            "mode": "compact",
+            "compact_unavailable": True,
+            "full_hint": _compact_full_hint(task_id),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _fallback_value(value: Any) -> Any:
+    """Bound pathological scalar fields only inside compact-unavailable."""
+    if not isinstance(value, str):
+        return value
+    if len(value) <= _KANBAN_SHOW_FALLBACK_PREVIEW_CHARS:
+        return value
+    return {
+        "preview": value[:_KANBAN_SHOW_FALLBACK_PREVIEW_CHARS] + "…",
+        "original_chars": len(value),
+    }
+
+
+def _compact_truncated_authoritative_sources(
+    *,
+    task: Any,
+    comments: list[Any],
+    runs: list[Any],
+    body_chars: int,
+    comment_chars: int,
+    field_chars: int,
+    max_comments: int,
+    max_prior_runs: int,
+) -> dict[str, int]:
+    """Identify canonical Full sources that worker_context cannot carry whole.
+
+    Compact is an orientation shortcut, not a semantic summarizer. If a task
+    body, comment, or prior-run field crosses ``build_worker_context``'s cap,
+    fail closed and tell the caller to request canonical Full. This avoids
+    guessing whether an omitted tail contains a human gate, blocker, or
+    merge/deploy directive.
+    """
+    truncated: dict[str, int] = {}
+
+    body = str(getattr(task, "body", None) or "").strip()
+    if len(body) > body_chars:
+        truncated["task_body"] = 1
+    if str(getattr(task, "result", None) or "").strip():
+        # A legacy result is present in canonical Full but is not rendered by
+        # build_worker_context for the task itself.
+        truncated["task_result"] = 1
+
+    lossy_comment_ids = {
+        comment.id
+        for comment in comments
+        if len(str(getattr(comment, "body", None) or "").strip())
+        > comment_chars
+    }
+    if len(comments) > max_comments:
+        lossy_comment_ids.update(
+            comment.id
+            for comment in comments[:-max_comments]
+        )
+    if lossy_comment_ids:
+        truncated["comments"] = len(lossy_comment_ids)
+
+    prior_runs = [run for run in runs if getattr(run, "ended_at", None) is not None]
+    lossy_run_ids = {
+        run.id for run in prior_runs[:-max_prior_runs]
+    }
+    for run in prior_runs[-max_prior_runs:]:
+        values = [getattr(run, "summary", None), getattr(run, "error", None)]
+        metadata = getattr(run, "metadata", None)
+        if metadata:
+            try:
+                values.append(
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+                )
+            except Exception:
+                # Unrenderable metadata cannot be proven safe for Compact.
+                lossy_run_ids.add(run.id)
+        if any(
+            len(str(value or "").strip()) > field_chars
+            for value in values
+        ):
+            lossy_run_ids.add(run.id)
+    if lossy_run_ids:
+        truncated["prior_runs"] = len(lossy_run_ids)
+
+    return truncated
+
+
+def _compact_fallback(
+    *,
+    task: Any,
+    parents: list[str],
+    children: list[str],
+    counts: dict[str, int],
+    worker_context_chars: int,
+    latest_comment: Optional[dict[str, Any]],
+    compact_candidate_chars: int,
+    truncated_authoritative_sources: Optional[dict[str, int]] = None,
+) -> str:
+    """Return a small authoritative core when the complete compact view is too big."""
+    task_core = {
+        field: _fallback_value(getattr(task, field, None))
+        for field in _KANBAN_SHOW_COMPACT_TASK_FIELDS
+    }
+    payload: dict[str, Any] = {
+        "mode": "compact",
+        "task": task_core,
+        "parents": [_fallback_value(value) for value in parents[:50]],
+        "children": [_fallback_value(value) for value in children[:50]],
+        "counts": counts,
+        "worker_context": None,
+        "worker_context_chars": worker_context_chars,
+        "latest_comment": latest_comment,
+        "full_hint": _compact_full_hint(str(task.id)),
+        "compact_unavailable": True,
+        "compact_candidate_chars": compact_candidate_chars,
+        "compact_limit_chars": _KANBAN_SHOW_COMPACT_MAX_CHARS,
+        "truncated_authoritative_sources": (
+            truncated_authoritative_sources or {}
+        ),
+        "omitted": {
+            "parents": max(0, len(parents) - 50),
+            "children": max(0, len(children) - 50),
+        },
+    }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if len(serialized) <= _KANBAN_SHOW_COMPACT_MAX_CHARS:
+        return serialized
+
+    # Pathological graph identifiers or comment authors can exceed the envelope.
+    # Keep counts and an explicit recovery path instead of silently head/tail
+    # truncating the authoritative worker context.
+    payload["parents"] = []
+    payload["children"] = []
+    payload["omitted"] = {
+        "parents": len(parents),
+        "children": len(children),
+    }
+    if latest_comment:
+        payload["latest_comment"] = {
+            "author": _fallback_value(latest_comment.get("author")),
+            "created_at": latest_comment.get("created_at"),
+            "body": _compact_cap_text(
+                latest_comment.get("body"), _KANBAN_SHOW_FALLBACK_PREVIEW_CHARS
+            ),
+            "body_chars": latest_comment.get("body_chars"),
+        }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if len(serialized) <= _KANBAN_SHOW_COMPACT_MAX_CHARS:
+        return serialized
+
+    emergency = {
+        "mode": "compact",
+        "task": {
+            "id": _fallback_value(str(task.id)),
+            "status": _fallback_value(getattr(task, "status", None)),
+            "tenant": _fallback_value(getattr(task, "tenant", None)),
+        },
+        "parents": [],
+        "children": [],
+        "counts": counts,
+        "worker_context": None,
+        "worker_context_chars": worker_context_chars,
+        "latest_comment": None,
+        "full_hint": _compact_full_hint(str(task.id)),
+        "compact_unavailable": True,
+        "compact_candidate_chars": compact_candidate_chars,
+        "compact_limit_chars": _KANBAN_SHOW_COMPACT_MAX_CHARS,
+        "truncated_authoritative_sources": (
+            truncated_authoritative_sources or {}
+        ),
+        "omitted": {"parents": len(parents), "children": len(children)},
+    }
+    return json.dumps(emergency, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
 def _handle_show(args: dict, **kw) -> str:
-    """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    """Read one task in legacy full mode or bounded compact orientation mode."""
+    if "mode" not in args:
+        mode = "full"
+    else:
+        mode = args.get("mode")
+        if mode not in {"compact", "full"}:
+            return tool_error("mode must be one of: compact, full")
+
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -442,7 +670,10 @@ def _handle_show(args: dict, **kw) -> str:
         try:
             task = kb.get_task(conn, tid)
             if task is None:
-                return tool_error(f"task {tid} not found")
+                message = f"task {tid} not found"
+                if mode == "compact":
+                    return _compact_show_error(message, tid)
+                return tool_error(message)
             comments = kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
@@ -474,6 +705,71 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
+            if mode == "compact":
+                attachments = kb.list_attachments(conn, tid)
+                worker_context = kb.build_worker_context(conn, tid)
+                latest_comment = None
+                if comments:
+                    latest = comments[-1]
+                    latest_body = (latest.body or "").strip()
+                    latest_comment = {
+                        "author": latest.author,
+                        "created_at": latest.created_at,
+                        "body": _compact_cap_text(
+                            latest.body, _KANBAN_SHOW_COMPACT_COMMENT_CHARS
+                        ),
+                        "body_chars": len(latest_body),
+                    }
+                counts = {
+                    "comments": len(comments),
+                    "events": len(events),
+                    "runs": len(runs),
+                    "attachments": len(attachments),
+                    "parents": len(parents),
+                    "children": len(children),
+                }
+                compact_payload = {
+                    "mode": "compact",
+                    "task": {
+                        field: getattr(task, field, None)
+                        for field in _KANBAN_SHOW_COMPACT_TASK_FIELDS
+                    },
+                    "parents": parents,
+                    "children": children,
+                    "counts": counts,
+                    "worker_context": worker_context,
+                    "worker_context_chars": len(worker_context),
+                    "latest_comment": latest_comment,
+                    "full_hint": _compact_full_hint(tid),
+                    "compact_unavailable": False,
+                }
+                compact = json.dumps(compact_payload, ensure_ascii=False)
+                truncated_sources = _compact_truncated_authoritative_sources(
+                    task=task,
+                    comments=comments,
+                    runs=runs,
+                    body_chars=kb._CTX_MAX_BODY_BYTES,
+                    comment_chars=kb._CTX_MAX_COMMENT_BYTES,
+                    field_chars=kb._CTX_MAX_FIELD_BYTES,
+                    max_comments=kb._CTX_MAX_COMMENTS,
+                    max_prior_runs=kb._CTX_MAX_PRIOR_ATTEMPTS,
+                )
+                if (
+                    not truncated_sources
+                    and len(compact) <= _KANBAN_SHOW_COMPACT_MAX_CHARS
+                ):
+                    return compact
+                return _compact_fallback(
+                    task=task,
+                    parents=parents,
+                    children=children,
+                    counts=counts,
+                    worker_context_chars=len(worker_context),
+                    latest_comment=latest_comment,
+                    compact_candidate_chars=len(compact),
+                    truncated_authoritative_sources=truncated_sources,
+                )
+
             return json.dumps({
                 "task": _task_dict(task),
                 "parents": parents,
@@ -499,10 +795,16 @@ def _handle_show(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         # Invalid board slug surfaces as ValueError from _normalize_board_slug.
-        return tool_error(f"kanban_show: {e}")
+        message = f"kanban_show: {e}"
+        if mode == "compact":
+            return _compact_show_error(message, tid)
+        return tool_error(message)
     except Exception as e:
         logger.exception("kanban_show failed")
-        return tool_error(f"kanban_show: {e}")
+        message = f"kanban_show: {e}"
+        if mode == "compact":
+            return _compact_show_error(message, tid)
+        return tool_error(message)
 
 
 def _handle_list(args: dict, **kw) -> str:
@@ -1505,12 +1807,12 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
-        "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "Read a task for orientation. mode='compact' returns task core fields, "
+        "dependency IDs, raw-data counts, the bounded worker context, latest "
+        "comment, and an explicit full-output hint. mode='full' (the default) "
+        "preserves the canonical legacy response byte-for-byte. Use compact "
+        "when starting or resuming work and full only when the raw history is "
+        "needed. Both modes are read-only."
     ),
     "parameters": {
         "type": "object",
@@ -1518,6 +1820,16 @@ KANBAN_SHOW_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["compact", "full"],
+                "default": "full",
+                "description": (
+                    "Progressive-disclosure view. Omit or use 'full' for the "
+                    "legacy canonical response; use 'compact' for bounded "
+                    "orientation with a visible recovery hint."
+                ),
             },
             "board": _board_schema_prop(),
         },

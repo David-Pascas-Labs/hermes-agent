@@ -80,6 +80,367 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_show_explicit_full_is_byte_identical_to_legacy_default(worker_env):
+    """Adding the mode knob must not change the pre-patch default envelope."""
+    from tools import kanban_tools as kt
+
+    legacy = kt._handle_show({})
+    explicit = kt._handle_show({"mode": "full"})
+
+    assert explicit == legacy
+    assert list(json.loads(legacy)) == [
+        "task", "parents", "children", "comments", "events", "runs",
+        "worker_context",
+    ]
+
+
+def test_show_schema_exposes_compact_full_with_full_default():
+    from tools import kanban_tools as kt
+
+    mode = kt.KANBAN_SHOW_SCHEMA["parameters"]["properties"]["mode"]
+    assert mode["type"] == "string"
+    assert mode["enum"] == ["compact", "full"]
+    assert mode["default"] == "full"
+
+
+def test_show_rejects_invalid_and_explicit_null_modes(worker_env):
+    from tools import kanban_tools as kt
+
+    for value in (None, "", "FULL", "summary", 1):
+        result = json.loads(kt._handle_show({"mode": value}))
+        assert "error" in result
+        assert "mode must be one of" in result["error"]
+
+
+def test_show_compact_bounds_pathological_error_identifiers(worker_env):
+    from tools import kanban_tools as kt
+
+    raw = kt._handle_show({
+        "mode": "compact",
+        "task_id": "t_" + ("x" * 40_000),
+    })
+    result = json.loads(raw)
+
+    assert len(raw) <= 30_000
+    assert result["mode"] == "compact"
+    assert result["compact_unavailable"] is True
+    assert "truncated" in result["error"]
+    assert "exact original task_id" in result["full_hint"]
+
+
+def test_show_compact_preserves_core_counts_context_and_latest_comment(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    directive = "  HUMAN DIRECTIVE: inspect the attached evidence first  "
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, worker_env, author="operator", body=directive)
+        expected_counts = {
+            "comments": len(kb.list_comments(conn, worker_env)),
+            "events": len(kb.list_events(conn, worker_env)),
+            "runs": len(kb.list_runs(conn, worker_env)),
+            "attachments": len(kb.list_attachments(conn, worker_env)),
+            "parents": len(kb.parent_ids(conn, worker_env)),
+            "children": len(kb.child_ids(conn, worker_env)),
+        }
+        expected_context = kb.build_worker_context(conn, worker_env)
+    finally:
+        conn.close()
+
+    full = json.loads(kt._handle_show({"mode": "full"}))
+    raw = kt._handle_show({"mode": "compact"})
+    compact = json.loads(raw)
+
+    assert len(raw) <= 30_000
+    assert compact["mode"] == "compact"
+    assert compact["compact_unavailable"] is False
+    assert compact["counts"] == expected_counts
+    assert compact["parents"] == full["parents"]
+    assert compact["children"] == full["children"]
+    assert compact["worker_context"] == expected_context == full["worker_context"]
+    assert compact["worker_context_chars"] == len(expected_context)
+    for field in (
+        "id", "title", "assignee", "status", "tenant", "priority",
+        "workspace_kind", "workspace_path", "current_run_id",
+        "model_override", "provider_override",
+    ):
+        assert compact["task"][field] == full["task"][field]
+    assert compact["latest_comment"]["author"] == "operator"
+    assert compact["latest_comment"]["body"] == directive.strip()
+    assert "kanban_show(mode=\"full\"" in compact["full_hint"]
+    assert "kanban_attachments" in compact["full_hint"]
+    assert "comments" not in compact
+    assert "events" not in compact
+    assert "runs" not in compact
+
+
+def test_show_compact_escalates_when_directive_is_after_comment_cap(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    directive = "MUST NOT MERGE OR DEPLOY"
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn,
+            worker_env,
+            author="operator",
+            body=("x" * 2050) + directive,
+        )
+    finally:
+        conn.close()
+
+    full = kt._handle_show({"mode": "full"})
+    compact_first = kt._handle_show({"mode": "compact"})
+    compact_second = kt._handle_show({"mode": "compact"})
+    compact = json.loads(compact_first)
+
+    assert directive in full
+    assert compact_first == compact_second
+    assert compact["compact_unavailable"] is True
+    assert compact["worker_context"] is None
+    assert "truncated_authoritative_sources" in compact
+    assert compact["truncated_authoritative_sources"]["comments"] == 1
+    assert "kanban_show(mode=\"full\"" in compact["full_hint"]
+
+
+def test_show_compact_escalates_legacy_task_result(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    directive = "MUST NOT DEPLOY WITHOUT HUMAN APPROVAL"
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET result = ? WHERE id = ?",
+            (directive, worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    full = json.loads(kt._handle_show({"mode": "full"}))
+    compact = json.loads(kt._handle_show({"mode": "compact"}))
+
+    assert full["task"]["result"] == directive
+    assert directive not in (compact.get("worker_context") or "")
+    assert compact["compact_unavailable"] is True
+    assert compact["truncated_authoritative_sources"]["task_result"] == 1
+
+
+@pytest.mark.parametrize(
+    ("card_id", "critical_fragment", "is_latest"),
+    [
+        (
+            "t_74307c94",
+            "produktiv nur nach neuer expliziter Human-Freigabe ausrollen",
+            True,
+        ),
+        (
+            "t_861bf131",
+            "nicht mergen/deployen, bis CI grün ist",
+            False,
+        ),
+        (
+            "t_d5b6c12c",
+            "Blocker dieser Ausführung",
+            False,
+        ),
+    ],
+)
+def test_show_compact_escalates_real_card_directive_tails(
+    worker_env,
+    card_id,
+    critical_fragment,
+    is_latest,
+):
+    """Regression cases from the independently reviewed 30-card golden set."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(
+            conn,
+            worker_env,
+            author="reviewer",
+            body=("x" * 2050) + critical_fragment,
+        )
+        if not is_latest:
+            kb.add_comment(
+                conn,
+                worker_env,
+                author="reviewer",
+                body="Later comment without the earlier human gate.",
+            )
+        assert any(
+            critical_fragment in comment.body
+            for comment in kb.list_comments(conn, worker_env)
+        ), card_id
+    finally:
+        conn.close()
+
+    compact = json.loads(kt._handle_show({"mode": "compact"}))
+
+    assert compact["compact_unavailable"] is True, card_id
+    assert compact["worker_context"] is None, card_id
+    assert compact["truncated_authoritative_sources"]["comments"] == 1, card_id
+
+
+def test_show_compact_keeps_dependencies_handoffs_and_attachment_paths(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="completed parent", assignee="researcher")
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="handoff summary",
+            metadata={"artifact": "/tmp/handoff.json"},
+        )
+        kb.link_tasks(conn, parent_id=parent, child_id=worker_env)
+        child = kb.create_task(
+            conn, title="dependent child", assignee="reviewer", parents=[worker_env]
+        )
+        attachment_id = kb.store_attachment_bytes(
+            conn,
+            worker_env,
+            "evidence.txt",
+            b"evidence",
+            content_type="text/plain",
+            uploaded_by="test",
+        )
+        attachment = next(
+            item for item in kb.list_attachments(conn, worker_env)
+            if item.id == attachment_id
+        )
+    finally:
+        conn.close()
+
+    compact = json.loads(kt._handle_show({"mode": "compact"}))
+
+    assert compact["compact_unavailable"] is False
+    assert compact["parents"] == [parent]
+    assert compact["children"] == [child]
+    assert compact["counts"]["attachments"] == 1
+    assert "handoff summary" in compact["worker_context"]
+    assert parent in compact["worker_context"]
+    assert attachment.stored_path in compact["worker_context"]
+
+
+def test_show_compact_falls_back_bounded_without_mutating_db(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(kb, "build_worker_context", lambda conn, tid: "x" * 40_000)
+    raw = kt._handle_show({"mode": "compact"})
+    compact = json.loads(raw)
+
+    assert len(raw) <= 30_000
+    assert compact["compact_unavailable"] is True
+    assert compact["worker_context"] is None
+    assert compact["worker_context_chars"] == 40_000
+    assert compact["compact_candidate_chars"] > 30_000
+    assert "kanban_show(mode=\"full\"" in compact["full_hint"]
+
+    conn = kb.connect()
+    try:
+        after = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    assert after == before
+
+
+def test_show_compact_stress_card_is_bounded_recoverable_and_read_only(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    parent_ids = [f"parent-{i}-" + ("p" * 1000) for i in range(50)]
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("b" * 200_000, worker_env))
+        conn.executemany(
+            "INSERT INTO tasks (id, title, assignee, status, created_at, result) "
+            "VALUES (?, ?, ?, 'done', ?, ?)",
+            [
+                (parent_id, f"parent {index}", "researcher", 1, "h" * 1000)
+                for index, parent_id in enumerate(parent_ids)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            [(parent_id, worker_env) for parent_id in parent_ids],
+        )
+        conn.executemany(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'operator', ?, ?)",
+            [(worker_env, "c" * 3000, index + 10) for index in range(1000)],
+        )
+        conn.executemany(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'stress', '{}', ?)",
+            [(worker_env, index + 10) for index in range(1000)],
+        )
+        conn.executemany(
+            "INSERT INTO task_runs "
+            "(task_id, profile, status, outcome, summary, started_at, ended_at) "
+            "VALUES (?, 'test-worker', 'done', 'success', ?, ?, ?)",
+            [
+                (worker_env, "r" * 1000, index + 10, index + 11)
+                for index in range(1000)
+            ],
+        )
+        conn.commit()
+        before = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+
+    compact_raw = kt._handle_show({"mode": "compact"})
+    compact = json.loads(compact_raw)
+    full_raw = kt._handle_show({"mode": "full"})
+    full = json.loads(full_raw)
+
+    assert len(compact_raw) <= 30_000
+    assert compact["compact_unavailable"] is True
+    assert compact["counts"] == {
+        "comments": 1000,
+        "events": 1002,
+        "runs": 1001,
+        "attachments": 0,
+        "parents": 50,
+        "children": 0,
+    }
+    assert compact["worker_context"] is None
+    assert compact["worker_context_chars"] > 30_000
+    assert "kanban_show(mode=\"full\"" in compact["full_hint"]
+    assert full["task"]["body"] == "b" * 200_000
+    assert len(full["comments"]) == 1000
+    assert len(full["runs"]) == 1001
+
+    conn = kb.connect()
+    try:
+        after = "\n".join(conn.iterdump())
+    finally:
+        conn.close()
+    assert after == before
+
+
+def test_worker_guidance_orients_with_compact_without_changing_dispatch_context():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert 'Call `kanban_show(mode="compact")` first' in KANBAN_GUIDANCE
+    assert "dispatcher" in KANBAN_GUIDANCE
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

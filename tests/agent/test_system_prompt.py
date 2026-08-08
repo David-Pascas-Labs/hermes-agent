@@ -116,7 +116,7 @@ class TestKanbanWorkerGuidance:
         stable = _stable_prompt(agent)
 
         assert "# Kanban task execution protocol" in stable
-        assert "Call `kanban_show()` first" in stable
+        assert 'Call `kanban_show(mode="compact")` first' in stable
         assert "kanban_complete" in stable
 
     def test_cron_child_context_ignores_stale_worker_guidance(self, monkeypatch):
